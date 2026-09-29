@@ -6,3 +6,7 @@ __pycache__/
 .env.*
 *.pem
 *.key
+backend/raftlab
+backend/scenarios/
+backend/cmd/raftlab/webdist/
+frontend/dist/
