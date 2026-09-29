@@ -1,0 +1,26 @@
+body { margin: 0; background: #0f172a; color: #e2e8f0; font: 14px/1.45 Inter, system-ui, sans-serif; }
+main { padding: 24px; max-width: 1500px; margin: auto; }
+h1 { font-size: 24px; }
+button { background: #2563eb; color: white; border: 0; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+button:hover { background: #1d4ed8; }
+input, textarea { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: 6px; padding: 7px; }
+textarea { width: 100%; min-height: 150px; font-family: ui-monospace, monospace; }
+.toolbar, .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 14px 0; padding: 14px; background: #1e293b; border-radius: 12px; }
+.controls label { display: flex; gap: 6px; align-items: center; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+.node { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; }
+.node header { display: flex; gap: 10px; align-items: center; justify-content: space-between; }
+.role { padding: 2px 8px; border-radius: 999px; text-transform: uppercase; font-size: 11px; }
+.leader { background: #16a34a; } .candidate { background: #ca8a04; } .follower { background: #475569; }
+.meta { color: #94a3b8; margin: 8px 0; }
+ol { padding-left: 20px; }
+.node li { display: grid; grid-template-columns: 34px 42px 1fr; gap: 4px; padding: 5px 0; border-bottom: 1px solid #334155; }
+.node li em { grid-column: 1 / -1; color: #86efac; font-style: normal; font-size: 12px; }
+.committed b { color: #86efac; } .uncommitted b { color: #fca5a5; }
+.split { display: grid; grid-template-columns: 380px 1fr; gap: 18px; margin-top: 20px; }
+.messages, .scenario { margin-bottom: 12px; }
+table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 10px; overflow: hidden; }
+th, td { padding: 5px 7px; border-bottom: 1px solid #334155; text-align: left; vertical-align: top; }
+th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
+.error { background: #7f1d1d; padding: 10px; border-radius: 8px; }
+@media (max-width: 900px) { .split { grid-template-columns: 1fr; } }

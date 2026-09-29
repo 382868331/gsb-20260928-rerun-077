@@ -1,0 +1,36 @@
+# RaftLab 分布式系统实验室
+
+一个在单个 Go 进程中运行多个虚拟 Raft 节点的交互演练。节点之间没有共享内存中的“上帝视角”：每个节点只根据自己的任期、投票、日志，以及通过可配置网络收到的 `RequestVote`、`AppendEntries` 消息改变状态。
+
+## 内容
+
+- 领导者选举：随机选举超时、任期、一票限制、多数派投票。
+- 日志复制：领导者追加、冲突回退、多数派提交、跟随者提交推进。
+- 网络模拟：定向延迟、链路断开、分区时立即丢弃在途消息、恢复后重新同步。
+- 确定性复演：虚拟时钟、固定 seed 和带时间戳的场景 JSON；事件顺序可保存后重放。
+- 正确性测试：少数派不能提交；恢复网络后旧领导者不能覆盖已确认日志。
+
+## 运行
+
+```bash
+cd backend
+go run .
+```
+
+另开终端：
+
+```bash
+cd frontend
+/做题/.tools/env20260928/frontend/node_modules/.bin/vite
+```
+
+打开 Vite 输出的本地地址。前端会把 `/api` 代理到 `http://localhost:8080`。
+
+## 验证
+
+```bash
+cd backend && go test ./...
+cd frontend && /做题/.tools/env20260928/frontend/node_modules/.bin/tsc --noEmit
+```
+
+页面中的绿色 `#index` 表示该节点本地已经提交；红色表示只是未确认日志。已提交视图由各节点自己的 `commitIndex` 和本地日志汇总展示，模拟器不会用共享状态替节点宣布成功。
