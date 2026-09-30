@@ -1,6 +1,9 @@
 package raft
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func advanceAsAPI(s *Simulator, ticks int64) {
 	start := s.Now()
@@ -76,6 +79,66 @@ func TestDeterministicReplay(t *testing.T) {
 		if string(MustJSON(a[i])) != string(MustJSON(b[i])) {
 			t.Fatalf("event %d differs", i)
 		}
+	}
+}
+
+func TestReplayActionsAreNotDuplicatedOnSave(t *testing.T) {
+	scenario := BuiltinMinorityFails()
+	s := Replay(scenario)
+	clientActions := 0
+	for _, action := range s.Actions() {
+		if action.Op == "client" {
+			clientActions++
+		}
+	}
+	want := 0
+	for _, action := range scenario.Actions {
+		if action.Op == "client" {
+			want++
+		}
+	}
+	if clientActions != want {
+		t.Fatalf("replay recorded %d client actions, want %d (saving must not duplicate them)", clientActions, want)
+	}
+}
+
+func TestLogLifecycleEvents(t *testing.T) {
+	s := Replay(BuiltinOldLeaderRejoin())
+	abandoned := 0
+	replicated := 0
+	committed := map[string]int{}
+	for _, event := range s.Events() {
+		switch event.Kind {
+		case "abandon":
+			if event.Data == "old-leader-unconfirmed" {
+				abandoned++
+			}
+		case "replicate", "append":
+			if event.Data != "" {
+				replicated++
+			}
+		case "commit":
+			committed[event.Data]++
+		}
+	}
+	if abandoned == 0 {
+		t.Fatal("old leader fork entry was never reported as abandoned")
+	}
+	if replicated == 0 {
+		t.Fatal("no replication events recorded")
+	}
+	if _, ok := committed["old-leader-unconfirmed"]; ok {
+		t.Fatal("minority fork entry must never appear as committed")
+	}
+}
+
+func TestNoLeaderSnapshotNeverReturnsNullSlices(t *testing.T) {
+	s := NewSimulator([]int{1, 2, 3}, 5)
+	state := s.Snapshot(0)
+	if state.InFlight == nil || state.Events == nil {
+		// Empty queue/event list must marshal as [] not null so UI lists render.
+		b, _ := json.Marshal(state)
+		t.Fatalf("snapshot contains null slices: %s", b)
 	}
 }
 

@@ -241,6 +241,10 @@ func (s *Simulator) send(m Message) {
 
 func (s *Simulator) deliverNow(n *Node, m Message) {
 	beforeRole, beforeTerm := n.Role, n.Term
+	before := map[int]Entry{}
+	for _, entry := range n.Log.snapshot() {
+		before[entry.Index] = entry
+	}
 	notes := n.Handle(m, s.random, s.time, s.send)
 	if n.Role != beforeRole || n.Term != beforeTerm {
 		s.record(Event{Kind: "role", Node: n.ID, Role: n.Role, Term: n.Term})
@@ -250,6 +254,33 @@ func (s *Simulator) deliverNow(n *Node, m Message) {
 		s.record(Event{Kind: "note", Node: n.ID, Term: n.Term, Detail: note, Data: m.Data})
 	}
 	s.recordCommits(n)
+	s.recordLogLifecycle(n, m, before)
+}
+
+func (s *Simulator) recordLogLifecycle(n *Node, m Message, before map[int]Entry) {
+	after := map[int]Entry{}
+	for _, entry := range n.Log.snapshot() {
+		after[entry.Index] = entry
+	}
+	for index, old := range before {
+		current, ok := after[index]
+		if ok && current.Term == old.Term && current.Data == old.Data {
+			continue
+		}
+		s.record(Event{Kind: "abandon", Node: n.ID, Term: old.Term, Index: index, Data: old.Data,
+			Detail: fmt.Sprintf("removed-by-%s", m.Type)})
+	}
+	for index, entry := range after {
+		if old, ok := before[index]; ok && old.Term == entry.Term && old.Data == entry.Data {
+			continue
+		}
+		kind := "replicate"
+		if m.Type == MsgClient {
+			kind = "append"
+		}
+		s.record(Event{Kind: kind, Node: n.ID, Term: entry.Term, Index: index, Data: entry.Data,
+			From: m.From, Detail: fmt.Sprintf("via-%s", m.Type)})
+	}
 }
 
 func (s *Simulator) recordCommits(n *Node) {
@@ -310,7 +341,8 @@ func (s *Simulator) Advance(delta int64) {
 }
 
 func (s *Simulator) Snapshot(limit int) State {
-	state := State{Now: s.time, Links: map[string]LinkState{}, Committed: map[int]string{}}
+	state := State{Now: s.time, Links: map[string]LinkState{}, Committed: map[int]string{},
+		InFlight: []Message{}, Events: []Event{}}
 	for _, id := range s.order {
 		n := s.nodes[id]
 		deadline := n.ElectionDeadline
@@ -355,11 +387,11 @@ func (s *Simulator) Snapshot(limit int) State {
 			state.Committed[index] = data
 		}
 	}
-	events := s.events
+	events := append([]Event(nil), s.events...)
 	if limit > 0 && len(events) > limit {
 		events = events[len(events)-limit:]
 	}
-	state.Events = append([]Event(nil), events...)
+	state.Events = events
 	return state
 }
 

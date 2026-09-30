@@ -35,17 +35,32 @@ export interface Event {
   detail?: string;
   data?: string;
   index?: number;
-  message?: Message;
   from?: number;
+  message?: Message;
   to?: number;
+  commit?: number;
+  delay?: number;
 }
 
 export interface State {
   now: number;
   nodes: NodeView[];
+  links?: Record<string, { from: number; to: number; delay: number; up: boolean }>;
   inFlight: Message[];
   events: Event[];
   committed: Record<string, string>;
+}
+
+export interface ScenarioAction {
+  op: 'advance' | 'delay' | 'link' | 'partition' | 'heal' | 'client';
+  at: number;
+  from?: number;
+  to?: number;
+  node?: number;
+  delay?: number;
+  up?: boolean;
+  data?: string;
+  groups?: number[][];
 }
 
 export interface Scenario {
@@ -54,5 +69,21 @@ export interface Scenario {
   nodes: number[];
   seed: number;
   initialLeader?: number;
-  actions: Array<Record<string, unknown>>;
+  actions: ScenarioAction[];
+}
+
+export type EntryStage = 'appended' | 'replicated' | 'committed' | 'abandoned';
+
+export interface EntryLifecycle {
+  data: string;
+  index: number;
+  term: number;
+  perNode: Record<number, { stage: EntryStage; at: number }>;
+}
+
+export interface Branch {
+  label: string;
+  scenarioName: string;
+  state: State;
+  lifecycle: Map<string, EntryLifecycle>;
 }

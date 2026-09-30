@@ -62,6 +62,10 @@ func Replay(scenario Scenario) *Simulator {
 			_ = s.Client(action.Node, action.Data)
 		}
 	}
+	// Replay reconstructs the recorded timeline; its actions must not be recorded a
+	// second time, otherwise saving and reopening the scenario would duplicate every
+	// client command and fork the log.
+	s.actions = append([]Action(nil), scenario.Actions...)
 	if !hasAdvance {
 		runTo(current + 1000)
 	}

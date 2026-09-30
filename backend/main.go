@@ -146,7 +146,7 @@ func main() {
 		lab.mu.Lock()
 		lab.scenario = *body.Scenario
 		lab.sim = raft.Replay(lab.scenario)
-		state := lab.sim.Snapshot(300)
+		state := lab.sim.Snapshot(0)
 		lab.mu.Unlock()
 		writeJSON(w, state)
 	})
