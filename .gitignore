@@ -7,3 +7,5 @@ __pycache__/
 *.pem
 *.key
 frontend/dist/
+backend/scenarios/
+backend/experiments/

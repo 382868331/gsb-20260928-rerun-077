@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
-import type { Event, NodeView, Scenario, State } from './types';
+import ErrorBoundary from './ErrorBoundary';
+import { ExperimentCard } from './Experiments';
+import type { Event, ExperimentView, NodeView, Scenario, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -54,11 +56,29 @@ export default function App() {
   const [delay, setDelay] = useState(80);
   const [customJson, setCustomJson] = useState('');
   const [error, setError] = useState('');
+  const [experiments, setExperiments] = useState<ExperimentView[]>([]);
+
+  // Replay scenarios can finish with an empty queue; the Go backend encodes
+  // that as JSON null. Normalize every array so empty scenarios still render.
+  const normalize = (next: State): State => ({
+    ...next,
+    nodes: next.nodes ?? [],
+    inFlight: next.inFlight ?? [],
+    events: next.events ?? [],
+  });
 
   const refresh = async (promise: Promise<State>) => {
     try {
-      setState(await promise);
+      setState(normalize(await promise));
       setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const loadExperiments = async () => {
+    try {
+      setExperiments(await api.experiments());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -66,9 +86,10 @@ export default function App() {
 
   useEffect(() => {
     Promise.all([api.state(), api.currentScenario()]).then(([nextState, nextScenario]) => {
-      setState(nextState);
+      setState(normalize(nextState));
       setScenario(nextScenario);
       setCustomJson(JSON.stringify(nextScenario, null, 2));
+      loadExperiments();
     }).catch((err) => setError(String(err)));
   }, []);
 
@@ -105,9 +126,28 @@ export default function App() {
   };
 
   const replayCustom = async () => {
-    const next = JSON.parse(customJson) as Scenario;
-    setScenario(next);
-    await refresh(api.replay(next));
+    try {
+      const next = JSON.parse(customJson) as Scenario;
+      setScenario(next);
+      await refresh(api.replay(next));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const forkAt = async (messageId: number) => {
+    try {
+      const experiment = await api.fork(messageId, '');
+      setExperiments((current) => [...current.filter((item) => item.id !== experiment.id), experiment]);
+      setState(normalize(await api.state()));
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const updateExperiment = (next: ExperimentView) => {
+    setExperiments((current) => current.map((item) => (item.id === next.id ? next : item)));
   };
 
   const saveCurrent = async () => {
@@ -122,55 +162,71 @@ export default function App() {
     <main>
       <h1>RaftLab：领导者选举与日志复演</h1>
       {error && <div className="error">{error}</div>}
-      <section className="toolbar">
-        <div>虚拟时间 <b>{state?.now ?? 0}</b> ticks</div>
-        <button onClick={() => state && refresh(api.advance(50))}>推进 50</button>
-        <button onClick={() => state && refresh(api.advance(250))}>推进 250</button>
-        <button onClick={() => refresh(api.heal())}>恢复全部链路</button>
-        <button onClick={() => replayBuiltin('minority')}>复演：少数派失败</button>
-        <button onClick={() => replayBuiltin('old')}>复演：旧领导追平</button>
-      </section>
+      <ErrorBoundary label="主工作区">
+        <section className="toolbar">
+          <div>虚拟时间 <b>{state?.now ?? 0}</b> ticks</div>
+          <button onClick={() => state && refresh(api.advance(50))}>推进 50</button>
+          <button onClick={() => state && refresh(api.advance(250))}>推进 250</button>
+          <button onClick={() => refresh(api.heal())}>恢复全部链路</button>
+          <button onClick={() => replayBuiltin('minority')}>复演：少数派失败</button>
+          <button onClick={() => replayBuiltin('old')}>复演：旧领导追平</button>
+        </section>
 
-      <section className="controls">
-        <label>客户端请求发给节点
-          <input type="number" value={node} min={1} max={5} onChange={(event) => setNode(Number(event.target.value))} />
-        </label>
-        <input value={data} onChange={(event) => setData(event.target.value)} />
-        <button onClick={() => refresh(api.client(node, data))}>追加日志</button>
-        <label>分组（每行一组）<textarea value={groups} onChange={(event) => setGroups(event.target.value)} /></label>
-        <button onClick={() => refresh(api.partition(parsedGroups))}>制造分区</button>
-        <label>链路 <input type="number" value={from} onChange={(e) => setFrom(Number(e.target.value))} /></label>
-        <span>→</span>
-        <label><input type="number" value={to} onChange={(e) => setTo(Number(e.target.value))} /></label>
-        <label>延迟 <input type="number" value={delay} onChange={(e) => setDelay(Number(e.target.value))} /></label>
-        <button onClick={() => refresh(api.link(from, to, { delay }))}>设置延迟</button>
-        <button onClick={() => refresh(api.link(from, to, { up: false }))}>断开链路</button>
-        <button onClick={() => refresh(api.link(from, to, { up: true }))}>恢复链路</button>
-      </section>
+        <section className="controls">
+          <label>客户端请求发给节点
+            <input type="number" value={node} min={1} max={5} onChange={(event) => setNode(Number(event.target.value))} />
+          </label>
+          <input value={data} onChange={(event) => setData(event.target.value)} />
+          <button onClick={() => refresh(api.client(node, data))}>追加日志</button>
+          <label>分组（每行一组）<textarea value={groups} onChange={(event) => setGroups(event.target.value)} /></label>
+          <button onClick={() => refresh(api.partition(parsedGroups))}>制造分区</button>
+          <label>链路 <input type="number" value={from} onChange={(e) => setFrom(Number(e.target.value))} /></label>
+          <span>→</span>
+          <label><input type="number" value={to} onChange={(e) => setTo(Number(e.target.value))} /></label>
+          <label>延迟 <input type="number" value={delay} onChange={(e) => setDelay(Number(e.target.value))} /></label>
+          <button onClick={() => refresh(api.link(from, to, { delay }))}>设置延迟</button>
+          <button onClick={() => refresh(api.link(from, to, { up: false }))}>断开链路</button>
+          <button onClick={() => refresh(api.link(from, to, { up: true }))}>恢复链路</button>
+        </section>
 
-      <section className="grid">{state?.nodes.map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
+        <section className="grid">{(state?.nodes ?? []).map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
 
-      <section className="split">
-        <div>
-          <h2>在途消息</h2>
-          <ul className="messages">
-            {state?.inFlight.map((message) => (
-              <li key={message.id}>{message.deliverAt}: {message.type} {message.from}→{message.to} term {message.term}</li>
-            ))}
-          </ul>
-          <h2>场景 JSON / 保存</h2>
-          <textarea className="scenario" value={customJson} onChange={(event) => setCustomJson(event.target.value)} />
-          <button onClick={replayCustom}>按 JSON 复演</button>
-          <button onClick={saveCurrent}>保存当前场景</button>
-        </div>
-        <div>
-          <h2>事件顺序（最近 300 条）</h2>
-          <table>
-            <thead><tr><th>t</th><th>事件</th><th>节点</th><th>term</th><th>消息/细节</th><th>数据</th></tr></thead>
-            <tbody>{state?.events.slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
-          </table>
-        </div>
-      </section>
+        <section className="split">
+          <div>
+            <h2>在途消息（可在指定消息投递前暂停并分叉）</h2>
+            <ul className="messages">
+              {(state?.inFlight ?? []).length === 0 && <li className="empty">队列已空：推进时间产生新消息，或切换其他复演场景。</li>}
+              {(state?.inFlight ?? []).map((message) => (
+                <li key={message.id}>
+                  {message.deliverAt}: {message.type} {message.from}→{message.to} term {message.term}
+                  <button onClick={() => forkAt(message.id)}>在此投递前暂停并分出两个实验</button>
+                </li>
+              ))}
+            </ul>
+            <h2>场景 JSON / 保存</h2>
+            <textarea className="scenario" value={customJson} onChange={(event) => setCustomJson(event.target.value)} />
+            <button onClick={replayCustom}>按 JSON 复演</button>
+            <button onClick={saveCurrent}>保存当前场景</button>
+          </div>
+          <div>
+            <h2>事件顺序（最近 300 条）</h2>
+            <table>
+              <thead><tr><th>t</th><th>事件</th><th>节点</th><th>term</th><th>消息/细节</th><th>数据</th></tr></thead>
+              <tbody>{(state?.events ?? []).slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
+            </table>
+          </div>
+        </section>
+
+        <section className="experiments">
+          <h2>暂停点实验（共同前缀一致，分叉后队列/计时独立；重开后自动恢复）</h2>
+          {experiments.length === 0 && <p className="empty">还没有暂停点。在上方在途消息上点击“在此投递前暂停并分出两个实验”。</p>}
+          {experiments.map((experiment) => (
+            <ErrorBoundary key={experiment.id} label={`实验 ${experiment.id}`}>
+              <ExperimentCard experiment={experiment} onChange={updateExperiment} />
+            </ErrorBoundary>
+          ))}
+        </section>
+      </ErrorBoundary>
     </main>
   );
 }

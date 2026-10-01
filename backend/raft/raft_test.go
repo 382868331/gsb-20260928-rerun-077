@@ -1,6 +1,8 @@
 package raft
 
-import "testing"
+import (
+	"testing"
+)
 
 func advanceAsAPI(s *Simulator, ticks int64) {
 	start := s.Now()

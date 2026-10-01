@@ -48,6 +48,31 @@ export interface State {
   committed: Record<string, string>;
 }
 
+export interface Decision {
+  at: number;
+  tick?: number;
+  op: string;
+  detail: string;
+}
+
+export interface BranchView {
+  name: string;
+  state: State;
+  decisions: Decision[];
+}
+
+export interface ExperimentView {
+  id: string;
+  label: string;
+  messageId: number;
+  messageType: string;
+  from: number;
+  to: number;
+  pausedAt: number;
+  createdAt: string;
+  branches: Record<string, BranchView>;
+}
+
 export interface Scenario {
   name: string;
   description: string;

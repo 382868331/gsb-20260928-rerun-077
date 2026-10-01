@@ -1,4 +1,4 @@
-import type { Scenario, State } from './types';
+import type { ExperimentView, Scenario, State } from './types';
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -21,4 +21,13 @@ export const api = {
   replay: (scenario: Scenario) => call<State>('/api/replay', { scenario }),
   currentScenario: () => call<Scenario>('/api/scenario'),
   save: (name: string, scenario: Scenario) => call<{ saved: boolean }>('/api/save', { name, scenario }),
+  experiments: () => call<ExperimentView[]>('/api/experiments'),
+  fork: (messageId: number, label: string) =>
+    call<ExperimentView>('/api/experiment/fork', { messageId, label }),
+  expAdvance: (experiment: string, branch: string, ticks: number) =>
+    call<ExperimentView>('/api/experiment/advance', { experiment, branch, ticks }),
+  expReorder: (experiment: string, branch: string, messageId: number) =>
+    call<ExperimentView>('/api/experiment/reorder', { experiment, branch, messageId }),
+  expLink: (experiment: string, branch: string, patch: { from: number; to: number; up?: boolean; delay?: number }) =>
+    call<ExperimentView>('/api/experiment/link', { experiment, branch, ...patch }),
 };

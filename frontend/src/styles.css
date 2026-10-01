@@ -24,3 +24,17 @@ th, td { padding: 5px 7px; border-bottom: 1px solid #334155; text-align: left; v
 th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
 .error { background: #7f1d1d; padding: 10px; border-radius: 8px; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+.empty { color: #94a3b8; font-style: italic; }
+.messages li button { margin-left: 8px; padding: 3px 8px; font-size: 12px; }
+.experiments { margin-top: 24px; }
+.experiment { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 14px; margin: 14px 0; }
+.experiment h3 small { color: #94a3b8; font-weight: 400; }
+.branch-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.branch { border: 1px dashed #475569; border-radius: 10px; padding: 12px; }
+.branch-controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.branch-controls input { width: 70px; }
+.tag { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 6px; border-radius: 6px; font-size: 12px; }
+.tag.committed { background: #14532d; color: #86efac; }
+.tag.uncommitted { background: #7f1d1d; color: #fca5a5; }
+.decisions { max-height: 160px; overflow: auto; }
+@media (max-width: 1100px) { .branch-grid { grid-template-columns: 1fr; } }

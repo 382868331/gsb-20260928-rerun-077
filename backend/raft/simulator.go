@@ -311,6 +311,8 @@ func (s *Simulator) Advance(delta int64) {
 
 func (s *Simulator) Snapshot(limit int) State {
 	state := State{Now: s.time, Links: map[string]LinkState{}, Committed: map[int]string{}}
+	state.InFlight = []Message{}
+	state.Events = []Event{}
 	for _, id := range s.order {
 		n := s.nodes[id]
 		deadline := n.ElectionDeadline
@@ -366,3 +368,147 @@ func (s *Simulator) Snapshot(limit int) State {
 func (s *Simulator) Events() []Event { return append([]Event(nil), s.events...) }
 
 func (s *Simulator) Now() int64 { return s.time }
+
+// Checkpoint captures the complete mutable state of a simulator so that an
+// experiment branch can diverge without affecting other branches.
+type Checkpoint struct {
+	Nodes   map[int]NodeCheckpoint `json:"nodes"`
+	Order   []int                  `json:"order"`
+	Links   map[string]LinkState   `json:"links"`
+	Queue   []Message              `json:"queue"`
+	Events  []Event                `json:"events"`
+	Actions []Action               `json:"actions"`
+	Time    int64                  `json:"time"`
+	Seed    uint64                 `json:"seed"`
+	NextMsg int                    `json:"nextMsg"`
+	Marks   map[int]int            `json:"marks"`
+}
+
+type NodeCheckpoint struct {
+	Node             Node         `json:"node"`
+	Entries          []Entry      `json:"entries"`
+	ElectionDeadline int64        `json:"electionDeadline"`
+	HeartbeatDue     int64        `json:"heartbeatDue"`
+	VotesGranted     map[int]bool `json:"votesGranted"`
+	NextIndex        map[int]int  `json:"nextIndex"`
+	MatchIndex       map[int]int  `json:"matchIndex"`
+}
+
+func (s *Simulator) Checkpoint() Checkpoint {
+	c := Checkpoint{
+		Nodes: map[int]NodeCheckpoint{}, Links: map[string]LinkState{},
+		Queue: []Message{}, Events: append([]Event(nil), s.events...),
+		Actions: append([]Action(nil), s.actions...),
+		Time:    s.time, Seed: s.seed, NextMsg: s.nextMsg,
+		Marks: map[int]int{},
+	}
+	c.Order = append(c.Order, s.order...)
+	for key, link := range s.links {
+		c.Links[key] = link
+	}
+	for _, q := range s.queue {
+		c.Queue = append(c.Queue, q.m)
+	}
+	for id, n := range s.nodes {
+		var votedFor *int
+		if n.VotedFor != nil {
+			v := *n.VotedFor
+			votedFor = &v
+		}
+		nc := NodeCheckpoint{
+			Node: Node{ID: n.ID, Role: n.Role, Term: n.Term, VotedFor: votedFor,
+				CommitIndex: n.CommitIndex, Peers: append([]int(nil), n.Peers...)},
+			Entries:          append([]Entry(nil), n.Log.entries...),
+			ElectionDeadline: n.ElectionDeadline, HeartbeatDue: n.HeartbeatDue,
+			VotesGranted: map[int]bool{}, NextIndex: map[int]int{}, MatchIndex: map[int]int{},
+		}
+		for k, v := range n.VotesGranted {
+			nc.VotesGranted[k] = v
+		}
+		for k, v := range n.NextIndex {
+			nc.NextIndex[k] = v
+		}
+		for k, v := range n.MatchIndex {
+			nc.MatchIndex[k] = v
+		}
+		c.Nodes[id] = nc
+	}
+	for k, v := range s.lastCommitEvent {
+		c.Marks[k] = v
+	}
+	return c
+}
+
+func Restore(c Checkpoint) *Simulator {
+	s := &Simulator{
+		nodes: map[int]*Node{}, order: append([]int(nil), c.Order...),
+		links: map[string]LinkState{}, queue: []queuedMessage{},
+		events: append([]Event(nil), c.Events...), actions: append([]Action(nil), c.Actions...),
+		time: c.Time, seed: c.Seed, nextMsg: c.NextMsg, lastCommitEvent: map[int]int{},
+	}
+	for key, link := range c.Links {
+		s.links[key] = link
+	}
+	for _, m := range c.Queue {
+		s.queue = append(s.queue, queuedMessage{m: m})
+	}
+	for id, nc := range c.Nodes {
+		n := &Node{
+			ID: nc.Node.ID, Role: nc.Node.Role, Term: nc.Node.Term, VotedFor: nc.Node.VotedFor,
+			CommitIndex: nc.Node.CommitIndex, Peers: append([]int(nil), nc.Node.Peers...),
+			Log:              &Log{entries: append([]Entry(nil), nc.Entries...)},
+			ElectionDeadline: nc.ElectionDeadline, HeartbeatDue: nc.HeartbeatDue,
+			VotesGranted: map[int]bool{}, NextIndex: map[int]int{}, MatchIndex: map[int]int{},
+		}
+		for k, v := range nc.VotesGranted {
+			n.VotesGranted[k] = v
+		}
+		for k, v := range nc.NextIndex {
+			n.NextIndex[k] = v
+		}
+		for k, v := range nc.MatchIndex {
+			n.MatchIndex[k] = v
+		}
+		s.nodes[id] = n
+	}
+	for k, v := range c.Marks {
+		s.lastCommitEvent[k] = v
+	}
+	return s
+}
+
+func (s *Simulator) Clone() *Simulator { return Restore(s.Checkpoint()) }
+
+// PeekQueue returns the messages that are still waiting to be delivered,
+// ordered by delivery time.
+func (s *Simulator) PeekQueue() []Message {
+	out := make([]Message, len(s.queue))
+	for i, q := range s.queue {
+		out[i] = q.m
+	}
+	return out
+}
+
+// DeliverFirst moves the message with the given ID to the front of the queue
+// while preserving the delivery times of all other messages. Messages sharing
+// the same delivery time are delivered in queue order, so this changes the
+// delivery ordering without inventing a new time.
+func (s *Simulator) DeliverFirst(id int) error {
+	idx := -1
+	for i, q := range s.queue {
+		if q.m.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("message %d is not queued", id)
+	}
+	q := s.queue[idx]
+	q.m.DeliverAt = s.time
+	s.queue[idx] = q
+	sort.SliceStable(s.queue, func(i, j int) bool { return s.queue[i].m.DeliverAt < s.queue[j].m.DeliverAt })
+	s.record(Event{Kind: "reorder", Message: &q.m, Detail: fmt.Sprintf("message %d first at %d", id, s.time)})
+	s.actions = append(s.actions, Action{Op: "reorder", At: s.time, MsgID: &id})
+	return nil
+}

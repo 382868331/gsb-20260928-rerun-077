@@ -15,6 +15,7 @@ type Action struct {
 	Up     *bool   `json:"up,omitempty"`
 	Data   string  `json:"data,omitempty"`
 	Groups [][]int `json:"groups,omitempty"`
+	MsgID  *int    `json:"msgId,omitempty"`
 }
 
 const ActionAdvance = "advance"
@@ -60,6 +61,10 @@ func Replay(scenario Scenario) *Simulator {
 			s.HealAll()
 		case "client":
 			_ = s.Client(action.Node, action.Data)
+		case "reorder":
+			if action.MsgID != nil {
+				_ = s.DeliverFirst(*action.MsgID)
+			}
 		}
 	}
 	if !hasAdvance {
