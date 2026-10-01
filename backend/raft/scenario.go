@@ -6,18 +6,49 @@ import (
 )
 
 type Action struct {
-	Op     string  `json:"op"`
-	At     int64   `json:"at"`
-	From   int     `json:"from,omitempty"`
-	To     int     `json:"to,omitempty"`
-	Node   int     `json:"node,omitempty"`
-	Delay  int64   `json:"delay,omitempty"`
-	Up     *bool   `json:"up,omitempty"`
-	Data   string  `json:"data,omitempty"`
-	Groups [][]int `json:"groups,omitempty"`
+	Op      string  `json:"op"`
+	At      int64   `json:"at"`
+	From    int     `json:"from,omitempty"`
+	To      int     `json:"to,omitempty"`
+	Node    int     `json:"node,omitempty"`
+	Delay   int64   `json:"delay,omitempty"`
+	Up      *bool   `json:"up,omitempty"`
+	Data    string  `json:"data,omitempty"`
+	Groups  [][]int `json:"groups,omitempty"`
+	Term    int     `json:"term,omitempty"`
+	MsgType string  `json:"msgType,omitempty"`
 }
 
-const ActionAdvance = "advance"
+const (
+	ActionAdvance      = "advance"
+	ActionPause        = "pause"
+	ActionDeliverFirst = "deliver-first"
+	ActionPostpone     = "postpone"
+)
+
+func (a Action) selector() Selector {
+	return Selector{Type: MessageType(a.MsgType), From: a.From, To: a.To, Term: a.Term, Data: a.Data}
+}
+
+// Decision records one experiment choice made after a branch point so it
+// can be traced and deterministically replayed after restart.
+type Decision struct {
+	ID      string   `json:"id"`
+	Kind    string   `json:"kind"`
+	Label   string   `json:"label"`
+	At      int64    `json:"at"`
+	Actions []Action `json:"actions"`
+}
+
+// ExperimentDoc is the persisted form of one forked experiment: the shared
+// prefix scenario plus the branch's own ordered decisions.
+type ExperimentDoc struct {
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Base      Scenario   `json:"base"`
+	Decisions []Decision `json:"decisions"`
+	CreatedAt string     `json:"createdAt"`
+}
 
 type Scenario struct {
 	Name          string   `json:"name"`
@@ -28,7 +59,10 @@ type Scenario struct {
 	Actions       []Action `json:"actions"`
 }
 
-func Replay(scenario Scenario) *Simulator {
+// RunScenario executes a scenario and, when stopAtPause is true, halts with
+// the simulator paused just before the first pause action's target message
+// is delivered. The second return value reports that paused state.
+func RunScenario(scenario Scenario, stopAtPause bool) (*Simulator, bool) {
 	s := NewSimulator(scenario.Nodes, scenario.Seed)
 	if scenario.InitialLeader != 0 {
 		_ = s.ElectInitial(scenario.InitialLeader)
@@ -44,11 +78,33 @@ func Replay(scenario Scenario) *Simulator {
 		}
 	}
 	for _, action := range actions {
-		runTo(action.At)
+		if stopAtPause && s.Paused() {
+			return s, true
+		}
+		if stopAtPause {
+			delta := action.At - current
+			if delta > 0 {
+				s.Advance(delta)
+				if s.Paused() {
+					return s, true
+				}
+				current = action.At
+			}
+		} else {
+			runTo(action.At)
+		}
 		switch action.Op {
 		case ActionAdvance:
 			hasAdvance = true
-			runTo(action.At + action.Delay)
+			if stopAtPause {
+				s.Advance(action.Delay)
+				if s.Paused() {
+					return s, true
+				}
+				current = action.At + action.Delay
+			} else {
+				runTo(action.At + action.Delay)
+			}
 		case "delay":
 			_ = s.SetDelay(action.From, action.To, action.Delay)
 		case "link":
@@ -60,12 +116,67 @@ func Replay(scenario Scenario) *Simulator {
 			s.HealAll()
 		case "client":
 			_ = s.Client(action.Node, action.Data)
+		case ActionPause:
+			s.ArmPause(action.selector())
+			if stopAtPause && s.Paused() {
+				return s, true
+			}
+		case ActionDeliverFirst:
+			_ = s.DeliverFirst(action.selector())
+		case ActionPostpone:
+			_ = s.Postpone(action.selector(), action.Delay)
 		}
 	}
-	if !hasAdvance {
+	if !stopAtPause && !hasAdvance {
 		runTo(current + 1000)
 	}
+	return s, s.Paused()
+}
+
+func Replay(scenario Scenario) *Simulator {
+	s, _ := RunScenario(scenario, false)
 	return s
+}
+
+// LoadExperiment rebuilds a forked experiment from its persisted document:
+// the common prefix is replayed to the pause point, then every recorded
+// branch decision is applied in order so the result is deterministic.
+func LoadExperiment(doc ExperimentDoc) (*Simulator, error) {
+	s, _ := RunScenario(doc.Base, true)
+	for _, decision := range doc.Decisions {
+		if decision.At > s.Now() {
+			s.Advance(decision.At - s.Now())
+		}
+		for _, action := range decision.Actions {
+			switch action.Op {
+			case ActionPause:
+				s.ArmPause(action.selector())
+			case ActionDeliverFirst:
+				if err := s.DeliverFirst(action.selector()); err != nil {
+					return nil, err
+				}
+			case ActionPostpone:
+				if err := s.Postpone(action.selector(), action.Delay); err != nil {
+					return nil, err
+				}
+			case ActionAdvance:
+				s.Advance(action.Delay)
+				s.RecordAdvance(action.At, action.At+action.Delay)
+			case "delay":
+				_ = s.SetDelay(action.From, action.To, action.Delay)
+			case "link":
+				up := action.Up == nil || *action.Up
+				s.SetLink(action.From, action.To, up)
+			case "partition":
+				s.Partition(action.Groups)
+			case "heal":
+				s.HealAll()
+			case "client":
+				_ = s.Client(action.Node, action.Data)
+			}
+		}
+	}
+	return s, nil
 }
 
 func BuiltinMinorityFails() Scenario {

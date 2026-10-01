@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
-import type { Event, NodeView, Scenario, State } from './types';
+import { BranchPanel, messageSelector } from './BranchPanel';
+import { ErrorBoundary } from './ErrorBoundary';
+import type { Event, ExperimentView, NodeView, Scenario, Selector, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -43,6 +45,8 @@ function EventLine({ event }: { event: Event }) {
   );
 }
 
+const inFlight = (state: State | null) => state?.inFlight ?? [];
+
 export default function App() {
   const [state, setState] = useState<State | null>(null);
   const [scenario, setScenario] = useState<Scenario | null>(null);
@@ -54,6 +58,7 @@ export default function App() {
   const [delay, setDelay] = useState(80);
   const [customJson, setCustomJson] = useState('');
   const [error, setError] = useState('');
+  const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -64,16 +69,35 @@ export default function App() {
     }
   };
 
+  const loadExperiments = async () => {
+    try {
+      const views = await api.experiments();
+      const next: Record<string, ExperimentView> = {};
+      for (const view of views) {
+        next[view.id] = view;
+      }
+      setBranches(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   useEffect(() => {
-    Promise.all([api.state(), api.currentScenario()]).then(([nextState, nextScenario]) => {
-      setState(nextState);
-      setScenario(nextScenario);
-      setCustomJson(JSON.stringify(nextScenario, null, 2));
-    }).catch((err) => setError(String(err)));
+    Promise.all([api.state(), api.currentScenario()])
+      .then(([nextState, nextScenario]) => {
+        setState(nextState);
+        setScenario(nextScenario);
+        setCustomJson(JSON.stringify(nextScenario, null, 2));
+      })
+      .catch((err) => setError(String(err)));
+    void loadExperiments();
   }, []);
 
   const parsedGroups = useMemo(() => {
-    return groups.split('\n').map((line) => line.split(',').map((value) => Number(value.trim())).filter(Boolean));
+    return groups
+      .split('\n')
+      .map((line) => line.split(',').map((value) => Number(value.trim())).filter(Boolean))
+      .filter((group) => group.length > 0);
   }, [groups]);
 
   const replayBuiltin = async (kind: 'minority' | 'old') => {
@@ -105,30 +129,69 @@ export default function App() {
   };
 
   const replayCustom = async () => {
-    const next = JSON.parse(customJson) as Scenario;
+    let next: Scenario;
+    try {
+      next = JSON.parse(customJson) as Scenario;
+    } catch (err) {
+      setError(`场景 JSON 无法解析，当前工作区保持不变：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     setScenario(next);
     await refresh(api.replay(next));
   };
 
   const saveCurrent = async () => {
     if (!scenario) return;
-    await api.save(scenario.name, scenario);
-    const saved = await api.currentScenario();
-    setScenario(saved);
-    setCustomJson(JSON.stringify(saved, null, 2));
+    try {
+      await api.save(scenario.name, scenario);
+      const saved = await api.currentScenario();
+      setScenario(saved);
+      setCustomJson(JSON.stringify(saved, null, 2));
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
   };
+
+  const armPause = async (selector: Selector) => {
+    await refresh(api.armPause(selector));
+  };
+
+  const forkAtPause = async () => {
+    if (!state?.paused || !state.pause) {
+      setError('当前没有暂停点：请先在在途消息上选择“投递前暂停”。');
+      return;
+    }
+    try {
+      const pair = await api.fork(state.pause);
+      setBranches((prev) => ({ ...prev, [pair.a.id]: pair.a, [pair.b.id]: pair.b }));
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const updateBranch = (next: ExperimentView) => {
+    setBranches((prev) => ({ ...prev, [next.id]: next }));
+  };
+
+  const branchList = Object.values(branches).sort((a, b) => a.id.localeCompare(b.id));
 
   return (
     <main>
       <h1>RaftLab：领导者选举与日志复演</h1>
-      {error && <div className="error">{error}</div>}
+      {error && <div className="error" role="alert">{error}</div>}
       <section className="toolbar">
-        <div>虚拟时间 <b>{state?.now ?? 0}</b> ticks</div>
+        <div>虚拟时间 <b>{state?.now ?? 0}</b> ticks{state?.paused ? ' · 已暂停在消息投递前' : ''}</div>
         <button onClick={() => state && refresh(api.advance(50))}>推进 50</button>
         <button onClick={() => state && refresh(api.advance(250))}>推进 250</button>
         <button onClick={() => refresh(api.heal())}>恢复全部链路</button>
         <button onClick={() => replayBuiltin('minority')}>复演：少数派失败</button>
         <button onClick={() => replayBuiltin('old')}>复演：旧领导追平</button>
+        {state?.paused
+          ? <button onClick={() => refresh(api.clearPause())}>取消暂停继续运行</button>
+          : <span className="pause-hint">在在途消息上点“投递前暂停”可冻结指定消息</span>}
+        <button className="fork-button" disabled={!state?.paused} onClick={forkAtPause}>在暂停点分出 A/B 两个实验</button>
       </section>
 
       <section className="controls">
@@ -148,14 +211,22 @@ export default function App() {
         <button onClick={() => refresh(api.link(from, to, { up: true }))}>恢复链路</button>
       </section>
 
-      <section className="grid">{state?.nodes.map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
+      <ErrorBoundary onError={setError}>
+        <section className="grid">{state?.nodes.map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
+      </ErrorBoundary>
 
       <section className="split">
         <div>
-          <h2>在途消息</h2>
+          <h2>在途消息{state?.paused ? '（已暂停）' : ''}</h2>
           <ul className="messages">
-            {state?.inFlight.map((message) => (
-              <li key={message.id}>{message.deliverAt}: {message.type} {message.from}→{message.to} term {message.term}</li>
+            {inFlight(state).length === 0 && <li className="empty">队列为空：没有在途消息，等待心跳或推进时钟产生消息。</li>}
+            {inFlight(state).map((message) => (
+              <li key={message.id}>
+                {message.deliverAt}: {message.type} {message.from}→{message.to} term {message.term}
+                {!state?.paused && (
+                  <button className="pause-btn" onClick={() => armPause(messageSelector(message))}>投递前暂停</button>
+                )}
+              </li>
             ))}
           </ul>
           <h2>场景 JSON / 保存</h2>
@@ -167,10 +238,27 @@ export default function App() {
           <h2>事件顺序（最近 300 条）</h2>
           <table>
             <thead><tr><th>t</th><th>事件</th><th>节点</th><th>term</th><th>消息/细节</th><th>数据</th></tr></thead>
-            <tbody>{state?.events.slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
+            <tbody>{(state?.events ?? []).slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
           </table>
         </div>
       </section>
+
+      {branchList.length > 0 && (
+        <section className="experiments">
+          <h2>实验分支比较（共同前缀一致，队列与计时互相独立；决策已持久化，重开后自动恢复）</h2>
+          <div className="branch-grid">
+            {branchList.map((experiment) => (
+              <BranchPanel
+                key={experiment.id}
+                title={experiment.name === 'a' ? '实验 A' : '实验 B'}
+                experiment={experiment}
+                onChange={updateBranch}
+                onError={setError}
+              />
+            ))}
+          </div>
+        </section>
+      )}
     </main>
   );
 }

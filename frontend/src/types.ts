@@ -43,9 +43,19 @@ export interface Event {
 export interface State {
   now: number;
   nodes: NodeView[];
-  inFlight: Message[];
+  inFlight: Message[] | null;
   events: Event[];
   committed: Record<string, string>;
+  paused: boolean;
+  pause?: Selector | null;
+}
+
+export interface Selector {
+  type?: string;
+  from?: number;
+  to?: number;
+  term?: number;
+  data?: string;
 }
 
 export interface Scenario {
@@ -55,4 +65,38 @@ export interface Scenario {
   seed: number;
   initialLeader?: number;
   actions: Array<Record<string, unknown>>;
+}
+
+export interface Action {
+  op: string;
+  at: number;
+  from?: number;
+  to?: number;
+  node?: number;
+  delay?: number;
+  up?: boolean;
+  data?: string;
+  groups?: number[][];
+  term?: number;
+  msgType?: string;
+}
+
+export interface Decision {
+  id: string;
+  kind: string;
+  label: string;
+  at: number;
+  actions: Action[];
+}
+
+export interface ExperimentDoc {
+  id: string;
+  name: string;
+  base: Scenario;
+  decisions: Decision[];
+  createdAt: string;
+}
+
+export interface ExperimentView extends ExperimentDoc {
+  state: State;
 }

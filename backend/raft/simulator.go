@@ -38,6 +38,8 @@ type State struct {
 	InFlight  []Message            `json:"inFlight"`
 	Events    []Event              `json:"events"`
 	Committed map[int]string       `json:"committed"`
+	Paused    bool                 `json:"paused"`
+	Pause     *Selector            `json:"pause,omitempty"`
 }
 
 type LinkState struct {
@@ -62,6 +64,8 @@ type Simulator struct {
 	seed            uint64
 	nextMsg         int
 	lastCommitEvent map[int]int
+	pause           *Selector
+	paused          bool
 }
 
 func LinkKey(from, to int) string { return fmt.Sprintf("%d->%d", from, to) }
@@ -267,6 +271,9 @@ func (s *Simulator) recordCommits(n *Node) {
 func (s *Simulator) Advance(delta int64) {
 	end := s.time + delta
 	for s.time < end {
+		if s.paused && s.matchingQueued() {
+			return
+		}
 		next := end
 		for _, id := range s.order {
 			n := s.nodes[id]
@@ -285,6 +292,15 @@ func (s *Simulator) Advance(delta int64) {
 			next = end
 		}
 		s.time = next
+		if s.pause != nil {
+			for _, q := range s.queue {
+				if q.m.DeliverAt <= s.time && s.pause.Matches(q.m) {
+					s.paused = true
+					s.record(Event{Kind: "paused", Detail: selectorDetail(*s.pause)})
+					return
+				}
+			}
+		}
 		for len(s.queue) > 0 && s.queue[0].m.DeliverAt <= s.time {
 			q := s.queue[0]
 			s.queue = s.queue[1:]
@@ -310,7 +326,11 @@ func (s *Simulator) Advance(delta int64) {
 }
 
 func (s *Simulator) Snapshot(limit int) State {
-	state := State{Now: s.time, Links: map[string]LinkState{}, Committed: map[int]string{}}
+	state := State{Now: s.time, Links: map[string]LinkState{}, Committed: map[int]string{}, InFlight: []Message{}, Events: []Event{}, Paused: s.paused}
+	if s.pause != nil {
+		p := *s.pause
+		state.Pause = &p
+	}
 	for _, id := range s.order {
 		n := s.nodes[id]
 		deadline := n.ElectionDeadline
@@ -355,14 +375,177 @@ func (s *Simulator) Snapshot(limit int) State {
 			state.Committed[index] = data
 		}
 	}
-	events := s.events
+	events := append([]Event(nil), s.events...)
 	if limit > 0 && len(events) > limit {
 		events = events[len(events)-limit:]
 	}
-	state.Events = append([]Event(nil), events...)
+	state.Events = events
 	return state
 }
 
 func (s *Simulator) Events() []Event { return append([]Event(nil), s.events...) }
 
 func (s *Simulator) Now() int64 { return s.time }
+
+// ArmPause stops the next Advance just before the first queued message
+// matching sel is delivered. The match is re-evaluated on every queue
+// change, so the pause survives message reordering in other branches.
+func (s *Simulator) ArmPause(sel Selector) {
+	copySel := sel
+	s.pause = &copySel
+	if s.matchingQueued() {
+		s.paused = true
+	}
+	s.record(Event{Kind: "pause-armed", Detail: selectorDetail(sel)})
+	s.actions = append(s.actions, Action{Op: ActionPause, At: s.time,
+		MsgType: string(sel.Type), From: sel.From, To: sel.To, Term: sel.Term, Data: sel.Data})
+}
+
+func selectorDetail(sel Selector) string {
+	return fmt.Sprintf("%s %d->%d term=%d data=%q", sel.Type, sel.From, sel.To, sel.Term, sel.Data)
+}
+
+func (s *Simulator) ClearPause() {
+	s.pause = nil
+	s.paused = false
+}
+
+// Paused reports whether a pause selector currently matches a queued
+// message and delivery is suspended before it.
+func (s *Simulator) Paused() bool { return s.paused }
+
+func (s *Simulator) matchingQueued() bool {
+	if s.pause == nil {
+		return false
+	}
+	for _, q := range s.queue {
+		if s.pause.Matches(q.m) {
+			return true
+		}
+	}
+	return false
+}
+
+// PendingMessage describes a message held behind a pause point.
+func (s *Simulator) PendingMessages() []Message {
+	out := []Message{}
+	for _, q := range s.queue {
+		out = append(out, q.m)
+	}
+	return out
+}
+
+// DeliverFirst moves the first queued message matching sel to the front of
+// the delivery queue, implementing an experiment's reordered delivery.
+func (s *Simulator) DeliverFirst(sel Selector) error {
+	idx := -1
+	for i := range s.queue {
+		if sel.Matches(s.queue[i].m) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("no queued message matches selector")
+	}
+	q := s.queue[idx]
+	s.queue = append(s.queue[:idx], s.queue[idx+1:]...)
+	s.queue = append([]queuedMessage{q}, s.queue...)
+	if idx > 0 && q.m.DeliverAt > s.time {
+		q.m.DeliverAt = s.time
+		q.m.SendAt = s.time
+		s.queue[0] = q
+	}
+	s.record(Event{Kind: "reorder", Detail: fmt.Sprintf("%s %d->%d first", q.m.Type, q.m.From, q.m.To)})
+	s.actions = append(s.actions, Action{Op: ActionDeliverFirst, At: s.time,
+		MsgType: string(q.m.Type), From: q.m.From, To: q.m.To, Term: q.m.Term, Data: q.m.Data})
+	s.ClearPause()
+	return nil
+}
+
+// Postpone pushes the first queued message matching sel behind all other
+// currently queued messages by the given delay.
+func (s *Simulator) Postpone(sel Selector, delay int64) error {
+	idx := -1
+	for i := range s.queue {
+		if sel.Matches(s.queue[i].m) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("no queued message matches selector")
+	}
+	q := s.queue[idx]
+	s.queue = append(s.queue[:idx], s.queue[idx+1:]...)
+	last := s.time
+	if len(s.queue) > 0 {
+		last = s.queue[len(s.queue)-1].m.DeliverAt
+	}
+	q.m.DeliverAt = last + delay
+	s.queue = append(s.queue, q)
+	s.record(Event{Kind: "reorder", Detail: fmt.Sprintf("%s %d->%d postponed to %d", q.m.Type, q.m.From, q.m.To, q.m.DeliverAt)})
+	s.actions = append(s.actions, Action{Op: ActionPostpone, At: s.time,
+		MsgType: string(q.m.Type), From: q.m.From, To: q.m.To, Term: q.m.Term, Data: q.m.Data, Delay: delay})
+	s.ClearPause()
+	return nil
+}
+
+// Clone returns an independent deep copy: both experiments share an
+// identical prefix (nodes, logs, links, queue and clock at fork time) and
+// diverge independently afterwards.
+func (s *Simulator) Clone() *Simulator {
+	clone := &Simulator{
+		order:           append([]int(nil), s.order...),
+		links:           map[string]LinkState{},
+		events:          append([]Event(nil), s.events...),
+		actions:         append([]Action(nil), s.actions...),
+		time:            s.time,
+		seed:            s.seed,
+		nextMsg:         s.nextMsg,
+		lastCommitEvent: map[int]int{},
+	}
+	clone.nodes = map[int]*Node{}
+	for id, n := range s.nodes {
+		copied := *n
+		copied.Log = &Log{entries: append([]Entry(nil), n.Log.entries...)}
+		copied.Peers = append([]int(nil), n.Peers...)
+		if n.VotedFor != nil {
+			v := *n.VotedFor
+			copied.VotedFor = &v
+		}
+		if n.VotesGranted != nil {
+			copied.VotesGranted = map[int]bool{}
+			for k, v := range n.VotesGranted {
+				copied.VotesGranted[k] = v
+			}
+		}
+		if n.NextIndex != nil {
+			copied.NextIndex = map[int]int{}
+			for k, v := range n.NextIndex {
+				copied.NextIndex[k] = v
+			}
+		}
+		if n.MatchIndex != nil {
+			copied.MatchIndex = map[int]int{}
+			for k, v := range n.MatchIndex {
+				copied.MatchIndex[k] = v
+			}
+		}
+		clone.nodes[id] = &copied
+	}
+	for key, link := range s.links {
+		clone.links[key] = link
+	}
+	clone.queue = append([]queuedMessage(nil), s.queue...)
+	for id, idx := range s.lastCommitEvent {
+		clone.lastCommitEvent[id] = idx
+	}
+	if s.pause != nil {
+		p := *s.pause
+		clone.pause = &p
+		clone.paused = s.paused
+	}
+	clone.record(Event{Kind: "fork", Detail: fmt.Sprintf("cloned at %d", s.time)})
+	return clone
+}
