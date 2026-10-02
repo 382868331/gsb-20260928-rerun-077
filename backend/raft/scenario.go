@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"fmt"
 	"sort"
 )
 
@@ -47,7 +48,57 @@ type ExperimentDoc struct {
 	Name      string     `json:"name"`
 	Base      Scenario   `json:"base"`
 	Decisions []Decision `json:"decisions"`
+	Controls  []Control  `json:"controls"`
 	CreatedAt string     `json:"createdAt"`
+}
+
+// Control is a saved counterfactual analysis: the same branch replayed
+// without one chosen network intervention, compared against the target
+// track. It is written once and never rewritten, so later branch progress
+// cannot rewrite a saved verdict.
+type Control struct {
+	ID           string           `json:"id"`
+	CreatedAt    string           `json:"createdAt"`
+	SourceID     string           `json:"sourceId"`
+	TargetID     string           `json:"targetId"`
+	DecisionID   string           `json:"decisionId"`
+	RemovedLabel string           `json:"removedLabel"`
+	ReportBefore DivergenceReport `json:"reportBefore"`
+	ReportAfter  DivergenceReport `json:"reportAfter"`
+	Explains     bool             `json:"explains"`
+}
+
+// IsNetworkIntervention reports whether a recorded decision changes network
+// conditions (as opposed to delivery reordering or pure time advancement),
+// so only those can be singled out for a counterfactual control.
+func IsNetworkIntervention(kind string) bool {
+	switch kind {
+	case "link-up", "link-down", "delay", "partition", "heal":
+		return true
+	}
+	return false
+}
+
+// WithoutDecision returns a copy of the document with one decision removed,
+// the basis for a counterfactual control track. All other decisions keep
+// their original order and content.
+func (doc ExperimentDoc) WithoutDecision(id string) (ExperimentDoc, Decision, error) {
+	out := doc
+	out.Decisions = make([]Decision, 0, len(doc.Decisions))
+	var removed Decision
+	found := false
+	for _, decision := range doc.Decisions {
+		if decision.ID == id && !found {
+			removed = decision
+			found = true
+			continue
+		}
+		out.Decisions = append(out.Decisions, decision)
+	}
+	if !found {
+		return doc, Decision{}, fmt.Errorf("decision %s not found in experiment %s", id, doc.ID)
+	}
+	return out, removed, nil
 }
 
 type Scenario struct {

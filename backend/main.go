@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,8 +24,9 @@ type Lab struct {
 }
 
 type experiment struct {
-	doc raft.ExperimentDoc
-	sim *raft.Simulator
+	doc       raft.ExperimentDoc
+	sim       *raft.Simulator
+	loadError string
 }
 
 const experimentDir = "experiments"
@@ -93,12 +95,22 @@ func (lab *Lab) loadExperiments() {
 		}
 		var doc raft.ExperimentDoc
 		if err := json.Unmarshal(raw, &doc); err != nil {
-			log.Printf("skip broken experiment %s: %v", entry.Name(), err)
+			log.Printf("broken experiment %s kept as record only: %v", entry.Name(), err)
+			doc = raft.ExperimentDoc{ID: strings.TrimSuffix(entry.Name(), ".json"), Name: "?",
+				Decisions: []raft.Decision{}, Controls: []raft.Control{}}
+			lab.experiments[doc.ID] = &experiment{doc: doc, loadError: "实验文件损坏，仅保留记录：" + err.Error()}
 			continue
+		}
+		if doc.Decisions == nil {
+			doc.Decisions = []raft.Decision{}
+		}
+		if doc.Controls == nil {
+			doc.Controls = []raft.Control{}
 		}
 		sim, err := raft.LoadExperiment(doc)
 		if err != nil {
-			log.Printf("skip unloadable experiment %s: %v", entry.Name(), err)
+			log.Printf("experiment %s kept but not replayable: %v", entry.Name(), err)
+			lab.experiments[doc.ID] = &experiment{doc: doc, loadError: "实验数据缺失，无法重放：" + err.Error()}
 			continue
 		}
 		lab.experiments[doc.ID] = &experiment{doc: doc, sim: sim}
@@ -107,11 +119,17 @@ func (lab *Lab) loadExperiments() {
 
 type experimentView struct {
 	raft.ExperimentDoc
-	State raft.State `json:"state"`
+	State     *raft.State `json:"state"`
+	LoadError string      `json:"loadError,omitempty"`
 }
 
 func (exp *experiment) view() experimentView {
-	return experimentView{ExperimentDoc: exp.doc, State: exp.sim.Snapshot(300)}
+	view := experimentView{ExperimentDoc: exp.doc, LoadError: exp.loadError}
+	if exp.sim != nil {
+		state := exp.sim.Snapshot(300)
+		view.State = &state
+	}
+	return view
 }
 
 // recordDecision captures simulator actions appended since before and adds
@@ -317,12 +335,14 @@ func (lab *Lab) routes() *http.ServeMux {
 			Op: "advance", At: lab.sim.Now(), Delay: 1 << 40,
 		})
 		now := time.Now().UTC().Format(time.RFC3339)
-		makeBranch := func(name string) *experiment {
+		makeBranch := func(name string) (*experiment, error) {
 			stamp := strconv.FormatInt(time.Now().UnixNano(), 36)
 			doc := raft.ExperimentDoc{
 				ID:        "exp-" + stamp + "-" + name,
 				Name:      name,
 				Base:      base,
+				Decisions: []raft.Decision{},
+				Controls:  []raft.Control{},
 				CreatedAt: now,
 			}
 			// Clone the live simulator at the pause point: both branches share
@@ -330,11 +350,24 @@ func (lab *Lab) routes() *http.ServeMux {
 			sim := lab.sim.Clone()
 			exp := &experiment{doc: doc, sim: sim}
 			lab.experiments[doc.ID] = exp
-			_ = lab.saveExperimentLocked(exp)
-			return exp
+			if err := lab.saveExperimentLocked(exp); err != nil {
+				delete(lab.experiments, doc.ID)
+				return nil, err
+			}
+			return exp, nil
 		}
-		branchA := makeBranch("a")
-		branchB := makeBranch("b")
+		branchA, err := makeBranch("a")
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "分叉失败：实验 A 无法保存（暂停点与工作区保持不变）："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		branchB, err := makeBranch("b")
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "分叉失败：实验 B 无法保存（实验 A 已保留，暂停点未清除）："+err.Error(), http.StatusInternalServerError)
+			return
+		}
 		viewA := branchA.view()
 		viewB := branchB.view()
 		lab.mu.Unlock()
@@ -375,6 +408,11 @@ func (lab *Lab) routes() *http.ServeMux {
 		if !ok {
 			lab.mu.Unlock()
 			http.Error(w, "experiment not found", http.StatusNotFound)
+			return
+		}
+		if exp.sim == nil {
+			lab.mu.Unlock()
+			http.Error(w, "该实验数据缺失，无法继续操作；其他实验不受影响："+exp.loadError, http.StatusConflict)
 			return
 		}
 		before := len(exp.sim.Actions())
@@ -497,6 +535,113 @@ func (lab *Lab) routes() *http.ServeMux {
 			}
 			return "postpone", nil
 		})
+	}))
+	mux.HandleFunc("GET /api/divergence", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		aID := r.URL.Query().Get("a")
+		bID := r.URL.Query().Get("b")
+		lab.mu.Lock()
+		expA, okA := lab.experiments[aID]
+		expB, okB := lab.experiments[bID]
+		lab.mu.Unlock()
+		if !okA || !okB {
+			http.Error(w, "experiment not found", http.StatusNotFound)
+			return
+		}
+		report, err := raft.AnalyzeExperiments(expA.doc, expB.doc)
+		if err != nil {
+			http.Error(w, "无法分析分歧："+err.Error(), http.StatusConflict)
+			return
+		}
+		writeJSON(w, report)
+	}))
+	// createControl saves a counterfactual: the source branch replayed
+	// without one explicitly chosen network intervention, compared against
+	// the target track. The saved control is immutable; later branch
+	// progress never rewrites it.
+	mux.HandleFunc("POST /api/experiments/{id}/controls", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			TargetID   string `json:"targetId"`
+			DecisionID string `json:"decisionId"`
+		}
+		if err := decode(r, &body); err != nil || body.TargetID == "" || body.DecisionID == "" {
+			http.Error(w, "targetId and decisionId required", http.StatusBadRequest)
+			return
+		}
+		id := r.PathValue("id")
+		lab.mu.Lock()
+		exp, ok := lab.experiments[id]
+		if !ok {
+			lab.mu.Unlock()
+			http.Error(w, "experiment not found", http.StatusNotFound)
+			return
+		}
+		target, ok := lab.experiments[body.TargetID]
+		if !ok {
+			lab.mu.Unlock()
+			http.Error(w, "target experiment not found", http.StatusNotFound)
+			return
+		}
+		var chosen *raft.Decision
+		for i := range exp.doc.Decisions {
+			if exp.doc.Decisions[i].ID == body.DecisionID {
+				chosen = &exp.doc.Decisions[i]
+				break
+			}
+		}
+		if chosen == nil {
+			lab.mu.Unlock()
+			http.Error(w, "未找到该干预记录：它不属于这条分支，不能随意归因", http.StatusBadRequest)
+			return
+		}
+		if !raft.IsNetworkIntervention(chosen.Kind) {
+			lab.mu.Unlock()
+			http.Error(w, "该决定不是网络干预（链路/延迟/分区/恢复），请选择网络干预建立对照", http.StatusBadRequest)
+			return
+		}
+		controlDoc, removed, err := exp.doc.WithoutDecision(body.DecisionID)
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := raft.LoadExperiment(controlDoc); err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "去掉该干预后分支无法重放，对照未保存，原实验未改动："+err.Error(), http.StatusConflict)
+			return
+		}
+		before, err := raft.AnalyzeExperiments(exp.doc, target.doc)
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "无法分析原轨迹："+err.Error(), http.StatusConflict)
+			return
+		}
+		after, err := raft.AnalyzeExperiments(controlDoc, target.doc)
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "无法分析对照轨迹："+err.Error(), http.StatusConflict)
+			return
+		}
+		diverges := before.Status == raft.DivergenceConfirmed || before.Status == raft.DivergenceOrderOnly
+		control := raft.Control{
+			ID:           "ctl-" + strconv.FormatInt(time.Now().UnixNano(), 36),
+			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+			SourceID:     exp.doc.ID,
+			TargetID:     target.doc.ID,
+			DecisionID:   body.DecisionID,
+			RemovedLabel: removed.Label,
+			ReportBefore: before,
+			ReportAfter:  after,
+			Explains:     diverges && after.Status == raft.DivergenceIdentical,
+		}
+		exp.doc.Controls = append(exp.doc.Controls, control)
+		if err := lab.saveExperimentLocked(exp); err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "对照保存失败："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		view := exp.view()
+		lab.mu.Unlock()
+		writeJSON(w, view)
 	}))
 	return mux
 }

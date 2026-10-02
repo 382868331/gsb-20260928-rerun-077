@@ -21,6 +21,26 @@ export function BranchPanel({ title, experiment, onChange, onError }: Props) {
   const [ticks, setTicks] = useState(100);
   const [groups, setGroups] = useState('1,2\n3,4,5');
   const state = experiment.state;
+  const decisions = experiment.decisions ?? [];
+
+  if (!state) {
+    return (
+      <section className="branch broken" id={`branch-${experiment.id}`}>
+        <header>
+          <h3>{title}（实验 {experiment.id}）</h3>
+        </header>
+        <div className="error" role="alert">
+          {experiment.loadError || '该实验数据缺失，无法展示；其他实验不受影响。'}
+        </div>
+        <h4>分支决策追溯（{decisions.length}）</h4>
+        <ol className="decisions">
+          {decisions.map((decision) => (
+            <li key={decision.id}>t {decision.at} · {decision.label}</li>
+          ))}
+        </ol>
+      </section>
+    );
+  }
 
   const run = async (promise: Promise<ExperimentView>) => {
     try {
@@ -36,7 +56,7 @@ export function BranchPanel({ title, experiment, onChange, onError }: Props) {
     .filter((group) => group.length > 0);
 
   return (
-    <section className="branch">
+    <section className="branch" id={`branch-${experiment.id}`}>
       <header>
         <h3>{title}（实验 {experiment.id}）</h3>
         <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}</span>
@@ -86,12 +106,12 @@ export function BranchPanel({ title, experiment, onChange, onError }: Props) {
           ))}
         </tbody>
       </table>
-      <h4>分支决策追溯（{experiment.decisions.length}）</h4>
+      <h4>分支决策追溯（{decisions.length}）</h4>
       <ol className="decisions">
-        {experiment.decisions.map((decision) => (
+        {decisions.map((decision) => (
           <li key={decision.id}>t {decision.at} · {decision.label}
             <ul>
-              {decision.actions.map((action, i) => (
+              {(decision.actions ?? []).map((action, i) => (
                 <li key={i}>{JSON.stringify(action)}</li>
               ))}
             </ul>

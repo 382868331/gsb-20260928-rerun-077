@@ -86,17 +86,54 @@ export interface Decision {
   kind: string;
   label: string;
   at: number;
-  actions: Action[];
+  actions: Action[] | null;
 }
 
 export interface ExperimentDoc {
   id: string;
   name: string;
   base: Scenario;
-  decisions: Decision[];
+  decisions: Decision[] | null;
+  controls: Control[] | null;
   createdAt: string;
 }
 
 export interface ExperimentView extends ExperimentDoc {
-  state: State;
+  state: State | null;
+  loadError?: string;
+}
+
+export type DivergenceStatus = 'confirmed' | 'order-only' | 'insufficient' | 'identical';
+
+export interface Delivery {
+  at: number;
+  type: string;
+  from: number;
+  to: number;
+  term: number;
+  data?: string;
+}
+
+export interface DivergenceReport {
+  status: DivergenceStatus;
+  detail: string;
+  at?: number;
+  node?: number;
+  index?: number;
+  dataA?: string;
+  dataB?: string;
+  deliveryA?: Delivery;
+  deliveryB?: Delivery;
+}
+
+export interface Control {
+  id: string;
+  createdAt: string;
+  sourceId: string;
+  targetId: string;
+  decisionId: string;
+  removedLabel: string;
+  reportBefore: DivergenceReport;
+  reportAfter: DivergenceReport;
+  explains: boolean;
 }

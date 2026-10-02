@@ -1,4 +1,4 @@
-import type { ExperimentView, Scenario, Selector, State } from './types';
+import type { DivergenceReport, ExperimentView, Scenario, Selector, State } from './types';
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -26,4 +26,7 @@ export const api = {
   fork: (selector: Selector) => call<{ a: ExperimentView; b: ExperimentView }>('/api/fork', { selector }),
   experiments: () => call<ExperimentView[]>('/api/experiments'),
   branch: (id: string, op: string, body?: unknown) => call<ExperimentView>(`/api/experiments/${id}/${op}`, body ?? {}),
+  divergence: (a: string, b: string) => call<DivergenceReport>(`/api/divergence?a=${a}&b=${b}`),
+  createControl: (id: string, targetId: string, decisionId: string) =>
+    call<ExperimentView>(`/api/experiments/${id}/controls`, { targetId, decisionId }),
 };

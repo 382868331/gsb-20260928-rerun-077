@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
+import { AnalysisPanel } from './AnalysisPanel';
 import { BranchPanel, messageSelector } from './BranchPanel';
 import { ErrorBoundary } from './ErrorBoundary';
 import type { Event, ExperimentView, NodeView, Scenario, Selector, State } from './types';
@@ -248,15 +249,21 @@ export default function App() {
           <h2>实验分支比较（共同前缀一致，队列与计时互相独立；决策已持久化，重开后自动恢复）</h2>
           <div className="branch-grid">
             {branchList.map((experiment) => (
-              <BranchPanel
-                key={experiment.id}
-                title={experiment.name === 'a' ? '实验 A' : '实验 B'}
-                experiment={experiment}
-                onChange={updateBranch}
-                onError={setError}
-              />
+              <ErrorBoundary key={experiment.id} onError={setError}>
+                <BranchPanel
+                  title={experiment.name === 'a' ? '实验 A' : '实验 B'}
+                  experiment={experiment}
+                  onChange={updateBranch}
+                  onError={setError}
+                />
+              </ErrorBoundary>
             ))}
           </div>
+          {branchList.length >= 2 && (
+            <ErrorBoundary onError={setError}>
+              <AnalysisPanel experiments={branchList} onChange={updateBranch} onError={setError} />
+            </ErrorBoundary>
+          )}
         </section>
       )}
     </main>
