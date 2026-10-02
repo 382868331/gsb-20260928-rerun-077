@@ -45,5 +45,16 @@ th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
 .decisions { font-size: 12px; color: #cbd5e1; }
 .decisions ul { margin: 4px 0; padding-left: 18px; }
 .decisions code, .decisions li li { color: #94a3b8; word-break: break-all; }
+.decisions li li { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+.analysis-btn { background: #0f766e; font-size: 11px; padding: 2px 7px; }
+.analysis-btn:hover { background: #0d9488; }
+.control-grid { display: grid; grid-template-columns: 1fr; gap: 14px; margin-top: 16px; }
+.analyses { margin-top: 24px; display: grid; gap: 12px; }
+.analysis-card { background: #1e293b; border: 1px solid #0f766e; border-radius: 12px; padding: 14px; }
+.analysis-card header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.analysis-card p { margin: 0 0 10px; color: #cbd5e1; }
+.analysis-messages { display: grid; gap: 4px; margin-bottom: 10px; color: #94a3b8; font-size: 12px; }
+.analysis-links { display: flex; gap: 14px; flex-wrap: wrap; }
+.analysis-links a { color: #93c5fd; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .branch-grid { grid-template-columns: 1fr; } }

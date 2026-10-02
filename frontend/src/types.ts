@@ -43,9 +43,9 @@ export interface Event {
 export interface State {
   now: number;
   nodes: NodeView[];
-  inFlight: Message[] | null;
+  inFlight: Message[];
   events: Event[];
-  committed: Record<string, string>;
+  committed: Record<string, string> | null;
   paused: boolean;
   pause?: Selector | null;
 }
@@ -95,8 +95,41 @@ export interface ExperimentDoc {
   base: Scenario;
   decisions: Decision[];
   createdAt: string;
+  readOnly?: boolean;
+}
+
+export interface InterventionRef {
+  experimentId: string;
+  decisionId: string;
+  actionIndex: number;
+  at: number;
+  label: string;
+}
+
+export interface DivergenceAnalysis {
+  id: string;
+  experimentAId: string;
+  experimentBId: string;
+  createdAt: string;
+  pausePoint?: Selector | null;
+  candidate: InterventionRef;
+  controlId: string;
+  classification: 'arrival-order-only' | 'different-acknowledgements' | 'incomplete';
+  sufficient: boolean;
+  complete: boolean;
+  explanation: string;
+  firstDecisionA: Decision;
+  firstDecisionB: Decision;
+  messageA?: Message | null;
+  messageB?: Message | null;
+  controlState?: State | null;
+  treatedState?: State | null;
+  oppositeState?: State | null;
+  controlDoc: ExperimentDoc;
+  treatedDoc: ExperimentDoc;
 }
 
 export interface ExperimentView extends ExperimentDoc {
-  state: State;
+  state: State | null;
+  loadError?: string;
 }

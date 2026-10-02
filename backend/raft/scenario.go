@@ -48,6 +48,7 @@ type ExperimentDoc struct {
 	Base      Scenario   `json:"base"`
 	Decisions []Decision `json:"decisions"`
 	CreatedAt string     `json:"createdAt"`
+	ReadOnly  bool       `json:"readOnly,omitempty"`
 }
 
 type Scenario struct {

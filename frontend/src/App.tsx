@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { BranchPanel, messageSelector } from './BranchPanel';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { Event, ExperimentView, NodeView, Scenario, Selector, State } from './types';
+import type { DivergenceAnalysis, Event, ExperimentView, InterventionRef, NodeView, Scenario, Selector, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -47,6 +47,10 @@ function EventLine({ event }: { event: Event }) {
 
 const inFlight = (state: State | null) => state?.inFlight ?? [];
 
+function formatMessage(message: NonNullable<DivergenceAnalysis['messageA']> | null | undefined) {
+  return message ? `${message.type} ${message.from}→${message.to} t${message.term} @${message.deliverAt}` : '消息记录缺失';
+}
+
 export default function App() {
   const [state, setState] = useState<State | null>(null);
   const [scenario, setScenario] = useState<Scenario | null>(null);
@@ -59,6 +63,7 @@ export default function App() {
   const [customJson, setCustomJson] = useState('');
   const [error, setError] = useState('');
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
+  const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -77,6 +82,7 @@ export default function App() {
         next[view.id] = view;
       }
       setBranches(next);
+      setAnalyses(await api.analyses());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -175,7 +181,47 @@ export default function App() {
     setBranches((prev) => ({ ...prev, [next.id]: next }));
   };
 
-  const branchList = Object.values(branches).sort((a, b) => a.id.localeCompare(b.id));
+  const analyzeIntervention = async (otherId: string, candidate: InterventionRef) => {
+    const other = branches[otherId];
+    const current = branches[candidate.experimentId];
+    if (!other || !current) {
+      setError('缺少对照轨迹，无法建立分析。');
+      return;
+    }
+    const [a, b] = current.name === 'a' ? [current, other] : [other, current];
+    try {
+      const analysis = await api.analyze(a.id, b.id, candidate);
+      const views = await api.experiments();
+      setBranches((prev) => {
+        const next = { ...prev };
+        for (const view of views) next[view.id] = view;
+        return next;
+      });
+      setAnalyses((prev) => [...prev, analysis]);
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const pairedBranch = (experiment: ExperimentView) => {
+    if (experiment.name === 'a') return experiment.id.replace(/-a$/, '-b');
+    if (experiment.name === 'b') return experiment.id.replace(/-b$/, '-a');
+    return '';
+  };
+
+  const safeState = (value: State | null): State => value ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
+  const branchList = Object.values(branches)
+    .filter((experiment) => experiment.name === 'a' || experiment.name === 'b' || Boolean(experiment.loadError))
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const controlList = Object.values(branches)
+    .filter((experiment) => experiment.readOnly)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  const classificationText: Record<DivergenceAnalysis['classification'], string> = {
+    'arrival-order-only': '仅消息到达顺序不同',
+    'different-acknowledgements': '节点已作不同确认',
+    incomplete: '资料尚未完整',
+  };
 
   return (
     <main>
@@ -212,7 +258,7 @@ export default function App() {
       </section>
 
       <ErrorBoundary onError={setError}>
-        <section className="grid">{state?.nodes.map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
+        <section className="grid">{safeState(state).nodes.map((nodeView) => <NodeCard key={nodeView.id} node={nodeView} />)}</section>
       </ErrorBoundary>
 
       <section className="split">
@@ -238,7 +284,7 @@ export default function App() {
           <h2>事件顺序（最近 300 条）</h2>
           <table>
             <thead><tr><th>t</th><th>事件</th><th>节点</th><th>term</th><th>消息/细节</th><th>数据</th></tr></thead>
-            <tbody>{(state?.events ?? []).slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
+            <tbody>{safeState(state).events.slice().reverse().map((event, index) => <EventLine key={`${event.t}-${event.kind}-${index}`} event={event} />)}</tbody>
           </table>
         </div>
       </section>
@@ -246,17 +292,60 @@ export default function App() {
       {branchList.length > 0 && (
         <section className="experiments">
           <h2>实验分支比较（共同前缀一致，队列与计时互相独立；决策已持久化，重开后自动恢复）</h2>
-          <div className="branch-grid">
-            {branchList.map((experiment) => (
-              <BranchPanel
-                key={experiment.id}
-                title={experiment.name === 'a' ? '实验 A' : '实验 B'}
-                experiment={experiment}
-                onChange={updateBranch}
-                onError={setError}
-              />
-            ))}
-          </div>
+          <ErrorBoundary onError={setError}>
+            <div className="branch-grid">
+              {branchList.map((experiment) => (
+                <BranchPanel
+                  key={experiment.id}
+                    title={experiment.loadError ? '保留的损坏记录' : experiment.name === 'a' ? '实验 A' : '实验 B'}
+                  experiment={experiment}
+                  pairId={pairedBranch(experiment)}
+                  onChange={updateBranch}
+                  onAnalyze={analyzeIntervention}
+                  onError={setError}
+                />
+              ))}
+            </div>
+          </ErrorBoundary>
+          {controlList.length > 0 && (
+            <div className="control-grid">
+              {controlList.map((experiment) => (
+                <div id={experiment.id} key={experiment.id}>
+                  <BranchPanel
+                    title="只读对照"
+                    experiment={experiment}
+                    pairId=""
+                    onChange={updateBranch}
+                    onAnalyze={() => undefined}
+                    onError={setError}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+      {analyses.length > 0 && (
+        <section className="analyses">
+          <h2>首次决定分歧分析（保存后不可变）</h2>
+          {analyses.map((analysis) => (
+            <article className="analysis-card" key={analysis.id} id={analysis.id}>
+              <header>
+                <strong>{classificationText[analysis.classification]}</strong>
+                <span>{analysis.sufficient ? '该干预足以解释目标分歧' : '该干预不足以单独解释或资料不完整'}</span>
+              </header>
+              <p>{analysis.explanation}</p>
+              <div className="analysis-messages">
+                <span>A：{formatMessage(analysis.messageA)}</span>
+                <span>B：{formatMessage(analysis.messageB)}</span>
+              </div>
+              <div className="analysis-links">
+                <a href={`#decision-${analysis.experimentAId}-${analysis.firstDecisionA.id}`}>回到 A 的对应消息和节点记录</a>
+                <a href={`#decision-${analysis.experimentBId}-${analysis.firstDecisionB.id}`}>回到 B 的对应消息和节点记录</a>
+                {analysis.controlId && <a href={`#${analysis.controlId}`}>查看只读对照</a>}
+              </div>
+            </article>
+          ))}
         </section>
       )}
     </main>

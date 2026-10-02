@@ -1,11 +1,13 @@
 import { useState } from 'react';
 import { api } from './api';
-import type { ExperimentView, Selector, State } from './types';
+import type { ExperimentView, InterventionRef, Selector, State } from './types';
 
 interface Props {
   title: string;
   experiment: ExperimentView;
+  pairId: string;
   onChange: (next: ExperimentView) => void;
+  onAnalyze: (pairId: string, candidate: InterventionRef) => void;
   onError: (message: string) => void;
 }
 
@@ -17,10 +19,16 @@ export function messageSelector(message: { type: string; from: number; to: numbe
   return { type: message.type, from: message.from, to: message.to, term: message.term, data: message.data };
 }
 
-export function BranchPanel({ title, experiment, onChange, onError }: Props) {
+const networkActions = new Set(['deliver-first', 'postpone', 'delay', 'link', 'partition', 'heal']);
+
+function fallbackState(state: State | null): State {
+  return state ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
+}
+
+export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, onError }: Props) {
   const [ticks, setTicks] = useState(100);
   const [groups, setGroups] = useState('1,2\n3,4,5');
-  const state = experiment.state;
+  const state = fallbackState(experiment.state);
 
   const run = async (promise: Promise<ExperimentView>) => {
     try {
@@ -39,13 +47,14 @@ export function BranchPanel({ title, experiment, onChange, onError }: Props) {
     <section className="branch">
       <header>
         <h3>{title}（实验 {experiment.id}）</h3>
-        <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}</span>
+        <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}{experiment.readOnly ? ' · 只读对照' : ''}</span>
       </header>
+      {experiment.loadError && <div className="error" role="alert">{experiment.loadError}</div>}
       <div className="branch-controls">
         <label>推进 <input type="number" value={ticks} onChange={(e) => setTicks(Number(e.target.value))} /></label>
-        <button onClick={() => run(api.branch(experiment.id, 'advance', { ticks }))}>推进</button>
-        <button onClick={() => run(api.branch(experiment.id, 'partition', { groups: parsedGroups }))}>分区</button>
-        <button onClick={() => run(api.branch(experiment.id, 'heal'))}>恢复网络</button>
+        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'advance', { ticks }))}>推进</button>
+        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'partition', { groups: parsedGroups }))}>分区</button>
+        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'heal'))}>恢复网络</button>
       </div>
       <textarea
         className="branch-groups"
@@ -89,10 +98,26 @@ export function BranchPanel({ title, experiment, onChange, onError }: Props) {
       <h4>分支决策追溯（{experiment.decisions.length}）</h4>
       <ol className="decisions">
         {experiment.decisions.map((decision) => (
-          <li key={decision.id}>t {decision.at} · {decision.label}
+          <li key={decision.id} id={`decision-${experiment.id}-${decision.id}`}>t {decision.at} · {decision.label}
             <ul>
               {decision.actions.map((action, i) => (
-                <li key={i}>{JSON.stringify(action)}</li>
+                <li key={i}>
+                  <code>{JSON.stringify(action)}</code>
+                  {networkActions.has(action.op) && !experiment.readOnly && pairId && (
+                    <button
+                      className="analysis-btn"
+                      onClick={() => onAnalyze(pairId, {
+                        experimentId: experiment.id,
+                        decisionId: decision.id,
+                        actionIndex: i,
+                        at: decision.at,
+                        label: decision.label,
+                      })}
+                    >
+                      建立不施加该干预的对照
+                    </button>
+                  )}
+                </li>
               ))}
             </ul>
           </li>
