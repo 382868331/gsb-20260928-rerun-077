@@ -62,6 +62,7 @@ export default function App() {
   const [delay, setDelay] = useState(80);
   const [customJson, setCustomJson] = useState('');
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
   const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
 
@@ -172,6 +173,11 @@ export default function App() {
       const pair = await api.fork(state.pause);
       setBranches((prev) => ({ ...prev, [pair.a.id]: pair.a, [pair.b.id]: pair.b }));
       setError('');
+      setNotice(
+        pair.created
+          ? `对照分支已完整建立：${pair.a.id} 与 ${pair.b.id}（来源暂停状态已记录）。`
+          : `该暂停状态的对照分支此前已建立（${pair.forkKey}），已载入原 A/B 分支，未生成新副本。`,
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -227,6 +233,7 @@ export default function App() {
     <main>
       <h1>RaftLab：领导者选举与日志复演</h1>
       {error && <div className="error" role="alert">{error}</div>}
+      {notice && <div className="notice" role="status">{notice}</div>}
       <section className="toolbar">
         <div>虚拟时间 <b>{state?.now ?? 0}</b> ticks{state?.paused ? ' · 已暂停在消息投递前' : ''}</div>
         <button onClick={() => state && refresh(api.advance(50))}>推进 50</button>
@@ -295,15 +302,16 @@ export default function App() {
           <ErrorBoundary onError={setError}>
             <div className="branch-grid">
               {branchList.map((experiment) => (
-                <BranchPanel
-                  key={experiment.id}
+                <ErrorBoundary key={experiment.id} onError={setError}>
+                  <BranchPanel
                     title={experiment.loadError ? '保留的损坏记录' : experiment.name === 'a' ? '实验 A' : '实验 B'}
-                  experiment={experiment}
-                  pairId={pairedBranch(experiment)}
-                  onChange={updateBranch}
-                  onAnalyze={analyzeIntervention}
-                  onError={setError}
-                />
+                    experiment={experiment}
+                    pairId={pairedBranch(experiment)}
+                    onChange={updateBranch}
+                    onAnalyze={analyzeIntervention}
+                    onError={setError}
+                  />
+                </ErrorBoundary>
               ))}
             </div>
           </ErrorBoundary>
@@ -311,14 +319,16 @@ export default function App() {
             <div className="control-grid">
               {controlList.map((experiment) => (
                 <div id={experiment.id} key={experiment.id}>
-                  <BranchPanel
-                    title="只读对照"
-                    experiment={experiment}
-                    pairId=""
-                    onChange={updateBranch}
-                    onAnalyze={() => undefined}
-                    onError={setError}
-                  />
+                  <ErrorBoundary onError={setError}>
+                    <BranchPanel
+                      title="只读对照"
+                      experiment={experiment}
+                      pairId=""
+                      onChange={updateBranch}
+                      onAnalyze={() => undefined}
+                      onError={setError}
+                    />
+                  </ErrorBoundary>
                 </div>
               ))}
             </div>
@@ -339,6 +349,13 @@ export default function App() {
                 <span>A：{formatMessage(analysis.messageA)}</span>
                 <span>B：{formatMessage(analysis.messageB)}</span>
               </div>
+              {(analysis.treatedBasis || analysis.oppositeBasis || analysis.controlBasis) && (
+                <ul className="analysis-basis">
+                  {analysis.treatedBasis && <li>干预侧依据：{analysis.treatedBasis.note}（{analysis.treatedBasis.experimentId}）</li>}
+                  {analysis.oppositeBasis && <li>另一侧依据：{analysis.oppositeBasis.note}（{analysis.oppositeBasis.experimentId}）</li>}
+                  {analysis.controlBasis && <li>对照依据：{analysis.controlBasis.note}（{analysis.controlBasis.experimentId}）</li>}
+                </ul>
+              )}
               <div className="analysis-links">
                 <a href={`#decision-${analysis.experimentAId}-${analysis.firstDecisionA.id}`}>回到 A 的对应消息和节点记录</a>
                 <a href={`#decision-${analysis.experimentBId}-${analysis.firstDecisionB.id}`}>回到 B 的对应消息和节点记录</a>

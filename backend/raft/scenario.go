@@ -1,8 +1,11 @@
 package raft
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
+	"strconv"
 )
 
 type Action struct {
@@ -49,6 +52,45 @@ type ExperimentDoc struct {
 	Decisions []Decision `json:"decisions"`
 	CreatedAt string     `json:"createdAt"`
 	ReadOnly  bool       `json:"readOnly,omitempty"`
+	Fork      *ForkInfo  `json:"fork,omitempty"`
+}
+
+// ForkInfo records the provenance of one forked branch: which frozen pause
+// state it was cloned from, which sibling belongs to the same request, and
+// whether the fork completed. It survives restarts so a retried request is
+// recognized instead of duplicated.
+type ForkInfo struct {
+	Key       string   `json:"key"`
+	Role      string   `json:"role"`
+	PairID    string   `json:"pairId"`
+	Pause     Selector `json:"pause"`
+	SourceAt  int64    `json:"sourceAt"`
+	Status    string   `json:"status"`
+	CreatedAt string   `json:"createdAt"`
+}
+
+// ForkKey identifies one fork request by the exact frozen source state, so
+// retrying the same request maps to the same pair of branches.
+func ForkKey(base Scenario, sel Selector, at int64) string {
+	sum := sha256.Sum256([]byte(string(MustJSON(base)) + "|" + selectorDetail(sel) + "|" + strconv.FormatInt(at, 10)))
+	return hex.EncodeToString(sum[:8])
+}
+
+// CloneDoc deep-copies an experiment document so a saved analysis cannot be
+// mutated when the live branch later appends decisions.
+func CloneDoc(doc ExperimentDoc) ExperimentDoc {
+	out := doc
+	out.Base.Nodes = append([]int(nil), doc.Base.Nodes...)
+	out.Base.Actions = append([]Action(nil), doc.Base.Actions...)
+	out.Decisions = append([]Decision(nil), doc.Decisions...)
+	for i := range out.Decisions {
+		out.Decisions[i].Actions = append([]Action(nil), doc.Decisions[i].Actions...)
+	}
+	if doc.Fork != nil {
+		fork := *doc.Fork
+		out.Fork = &fork
+	}
+	return out
 }
 
 type Scenario struct {

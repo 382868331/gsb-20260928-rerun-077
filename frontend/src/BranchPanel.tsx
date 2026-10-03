@@ -25,10 +25,16 @@ function fallbackState(state: State | null): State {
   return state ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
 }
 
+function formatPause(fork: { pause: { type?: string; from?: number; to?: number }; sourceAt: number }) {
+  return `${fork.pause.type ?? '?'} ${fork.pause.from ?? '?'}→${fork.pause.to ?? '?'} @t${fork.sourceAt}`;
+}
+
 export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, onError }: Props) {
   const [ticks, setTicks] = useState(100);
   const [groups, setGroups] = useState('1,2\n3,4,5');
   const state = fallbackState(experiment.state);
+  const decisions = experiment.decisions ?? [];
+  const broken = Boolean(experiment.loadError);
 
   const run = async (promise: Promise<ExperimentView>) => {
     try {
@@ -49,12 +55,18 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
         <h3>{title}（实验 {experiment.id}）</h3>
         <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}{experiment.readOnly ? ' · 只读对照' : ''}</span>
       </header>
+      {experiment.fork && (
+        <div className="fork-origin">
+          来源暂停状态：{formatPause(experiment.fork)} · 配对 {experiment.fork.pairId} ·{' '}
+          {experiment.fork.status === 'complete' ? '已完整建立' : `建立状态：${experiment.fork.status}`}
+        </div>
+      )}
       {experiment.loadError && <div className="error" role="alert">{experiment.loadError}</div>}
       <div className="branch-controls">
         <label>推进 <input type="number" value={ticks} onChange={(e) => setTicks(Number(e.target.value))} /></label>
-        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'advance', { ticks }))}>推进</button>
-        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'partition', { groups: parsedGroups }))}>分区</button>
-        <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'heal'))}>恢复网络</button>
+        <button disabled={experiment.readOnly || broken} onClick={() => run(api.branch(experiment.id, 'advance', { ticks }))}>推进</button>
+        <button disabled={experiment.readOnly || broken} onClick={() => run(api.branch(experiment.id, 'partition', { groups: parsedGroups }))}>分区</button>
+        <button disabled={experiment.readOnly || broken} onClick={() => run(api.branch(experiment.id, 'heal'))}>恢复网络</button>
       </div>
       <textarea
         className="branch-groups"
@@ -67,7 +79,7 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
         {inFlight(state).map((message) => (
           <li key={message.id}>
             {message.deliverAt}: {message.type} {message.from}→{message.to} term {message.term}
-            {state.paused && (
+            {state.paused && !broken && (
               <span className="queue-actions">
                 <button onClick={() => run(api.branch(experiment.id, 'deliver-first', { selector: messageSelector(message) }))}>
                   优先投递
@@ -90,17 +102,17 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
               <td>{node.role}</td>
               <td>{node.term}</td>
               <td>{node.commitIndex}</td>
-              <td>{node.log.map((entry) => `${entry.index}:${entry.data}`).join(' | ') || '—'}</td>
+              <td>{(node.log ?? []).map((entry) => `${entry.index}:${entry.data}`).join(' | ') || '—'}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      <h4>分支决策追溯（{experiment.decisions.length}）</h4>
+      <h4>分支决策追溯（{decisions.length}）</h4>
       <ol className="decisions">
-        {experiment.decisions.map((decision) => (
+        {decisions.map((decision) => (
           <li key={decision.id} id={`decision-${experiment.id}-${decision.id}`}>t {decision.at} · {decision.label}
             <ul>
-              {decision.actions.map((action, i) => (
+              {(decision.actions ?? []).map((action, i) => (
                 <li key={i}>
                   <code>{JSON.stringify(action)}</code>
                   {networkActions.has(action.op) && !experiment.readOnly && pairId && (

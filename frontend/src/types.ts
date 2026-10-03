@@ -89,6 +89,16 @@ export interface Decision {
   actions: Action[];
 }
 
+export interface ForkInfo {
+  key: string;
+  role: string;
+  pairId: string;
+  pause: Selector;
+  sourceAt: number;
+  status: string;
+  createdAt: string;
+}
+
 export interface ExperimentDoc {
   id: string;
   name: string;
@@ -96,6 +106,7 @@ export interface ExperimentDoc {
   decisions: Decision[];
   createdAt: string;
   readOnly?: boolean;
+  fork?: ForkInfo | null;
 }
 
 export interface InterventionRef {
@@ -125,8 +136,25 @@ export interface DivergenceAnalysis {
   controlState?: State | null;
   treatedState?: State | null;
   oppositeState?: State | null;
+  treatedBasis?: StateBasis | null;
+  oppositeBasis?: StateBasis | null;
+  controlBasis?: StateBasis | null;
   controlDoc: ExperimentDoc;
   treatedDoc: ExperimentDoc;
+}
+
+export interface StateBasis {
+  experimentId: string;
+  decisionId: string;
+  note: string;
+}
+
+export interface ForkResult {
+  a: ExperimentView;
+  b: ExperimentView;
+  created: boolean;
+  forkKey: string;
+  status: string;
 }
 
 export interface ExperimentView extends ExperimentDoc {

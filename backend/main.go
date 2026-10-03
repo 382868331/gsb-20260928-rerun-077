@@ -435,18 +435,46 @@ func (lab *Lab) routes() *http.ServeMux {
 		base.Actions = append(base.Actions, raft.Action{
 			Op: "advance", At: lab.sim.Now(), Delay: 1 << 40,
 		})
-		now := time.Now().UTC().Format(time.RFC3339)
-		makeBranch := func(name string) *experiment {
-			stamp := strconv.FormatInt(time.Now().UnixNano(), 36)
-			id := "exp-" + stamp + "-" + name
-			for suffix := 1; lab.experiments[id] != nil; suffix++ {
-				id = fmt.Sprintf("exp-%s-%s-%d", stamp, name, suffix)
+		forkKey := raft.ForkKey(base, body.Selector, lab.sim.Now())
+		idA := "exp-" + forkKey + "-a"
+		idB := "exp-" + forkKey + "-b"
+		existingA, hasA := lab.experiments[idA]
+		existingB, hasB := lab.experiments[idB]
+		if hasA && hasB {
+			// Idempotent retry: the same frozen pause state already produced
+			// this pair; return it instead of adding look-alike branches.
+			viewA := existingA.view()
+			viewB := existingB.view()
+			lab.mu.Unlock()
+			writeJSON(w, map[string]any{"a": viewA, "b": viewB, "created": false, "forkKey": forkKey, "status": "existing"})
+			return
+		}
+		if hasA != hasB {
+			missing := idA
+			if hasA {
+				missing = idB
 			}
+			lab.mu.Unlock()
+			http.Error(w, "该暂停状态的分叉此前只完成了一部分：缺少 "+missing+"。未新建分支以避免归属混乱，请先处理残留记录。", http.StatusConflict)
+			return
+		}
+		now := time.Now().UTC().Format(time.RFC3339)
+		makeBranch := func(name, id, pairID string) *experiment {
 			doc := raft.ExperimentDoc{
 				ID:        id,
 				Name:      name,
 				Base:      base,
+				Decisions: []raft.Decision{},
 				CreatedAt: now,
+				Fork: &raft.ForkInfo{
+					Key:       forkKey,
+					Role:      name,
+					PairID:    pairID,
+					Pause:     body.Selector,
+					SourceAt:  lab.sim.Now(),
+					Status:    "complete",
+					CreatedAt: now,
+				},
 			}
 			// Clone the live simulator at the pause point: both branches share
 			// the exact same prefix and then diverge independently.
@@ -455,13 +483,13 @@ func (lab *Lab) routes() *http.ServeMux {
 			lab.experiments[doc.ID] = exp
 			return exp
 		}
-		branchA := makeBranch("a")
-		branchB := makeBranch("b")
+		branchA := makeBranch("a", idA, idB)
+		branchB := makeBranch("b", idB, idA)
 		if err := lab.saveExperimentLocked(branchA); err != nil {
 			delete(lab.experiments, branchA.doc.ID)
 			delete(lab.experiments, branchB.doc.ID)
 			lab.mu.Unlock()
-			http.Error(w, "分叉 A 保存失败，未保留半成品："+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "分叉完全没有建立：分支 A 保存失败，未保留半成品："+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		if err := lab.saveExperimentLocked(branchB); err != nil {
@@ -469,13 +497,13 @@ func (lab *Lab) routes() *http.ServeMux {
 			delete(lab.experiments, branchA.doc.ID)
 			delete(lab.experiments, branchB.doc.ID)
 			lab.mu.Unlock()
-			http.Error(w, "分叉 B 保存失败，已回滚 A，现有实验未改动："+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "分叉完全没有建立：分支 B 保存失败，已回滚 A，现有实验未改动："+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		viewA := branchA.view()
 		viewB := branchB.view()
 		lab.mu.Unlock()
-		writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+		writeJSON(w, map[string]any{"a": viewA, "b": viewB, "created": true, "forkKey": forkKey, "status": "complete"})
 	}))
 	mux.HandleFunc("GET /api/experiments", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		lab.mu.Lock()
@@ -553,6 +581,7 @@ func (lab *Lab) routes() *http.ServeMux {
 		var controlDoc raft.ExperimentDoc
 		var controlSim, treatedAt, oppositeAt *raft.Simulator
 		var messageTreated, messageOpposite *raft.Message
+		var treatedBasis, oppositeBasis, controlBasis *raft.StateBasis
 		if body.Candidate.DecisionID == firstOnTreated.ID && isNetworkIntervention(action) && actionErr == nil {
 			var err error
 			controlDoc, _, err = raft.ExperimentWithoutAction(treated.doc, body.Candidate)
@@ -623,6 +652,18 @@ func (lab *Lab) routes() *http.ServeMux {
 				}
 				lab.experiments[controlDoc.ID] = controlExp
 			}
+			treatedBasis = &raft.StateBasis{
+				ExperimentID: treated.doc.ID, DecisionID: firstOnTreated.ID,
+				Note: "干预轨迹冻结在首次分歧决定 " + firstOnTreated.ID + " 应用之后的状态",
+			}
+			oppositeBasis = &raft.StateBasis{
+				ExperimentID: opposite.doc.ID, DecisionID: firstOnOpposite.ID,
+				Note: "另一轨迹冻结在其首次分歧决定 " + firstOnOpposite.ID + " 应用之后的状态",
+			}
+			controlBasis = &raft.StateBasis{
+				ExperimentID: controlDoc.ID, DecisionID: body.Candidate.DecisionID,
+				Note: "只读对照在同一决定处跳过所选干预后冻结的状态",
+			}
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		id := "analysis-" + strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -644,7 +685,8 @@ func (lab *Lab) routes() *http.ServeMux {
 			PausePoint: pausePoint, Candidate: body.Candidate, ControlID: controlDoc.ID,
 			Classification: classification, Sufficient: sufficient, Complete: complete, Explanation: explanation,
 			FirstDecisionA: decisionA, FirstDecisionB: decisionB, MessageA: messageForPair(expA.doc, decisionA),
-			MessageB: messageForPair(expB.doc, decisionB), ControlDoc: controlDoc, TreatedDoc: treated.doc,
+			MessageB: messageForPair(expB.doc, decisionB), ControlDoc: raft.CloneDoc(controlDoc), TreatedDoc: raft.CloneDoc(treated.doc),
+			TreatedBasis: treatedBasis, OppositeBasis: oppositeBasis, ControlBasis: controlBasis,
 		}
 		if controlSim != nil {
 			state := controlSim.Snapshot(300)

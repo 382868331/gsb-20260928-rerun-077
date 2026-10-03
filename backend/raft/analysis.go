@@ -29,8 +29,20 @@ type DivergenceAnalysis struct {
 	ControlState   *State          `json:"controlState,omitempty"`
 	TreatedState   *State          `json:"treatedState,omitempty"`
 	OppositeState  *State          `json:"oppositeState,omitempty"`
+	TreatedBasis   *StateBasis     `json:"treatedBasis,omitempty"`
+	OppositeBasis  *StateBasis     `json:"oppositeBasis,omitempty"`
+	ControlBasis   *StateBasis     `json:"controlBasis,omitempty"`
 	ControlDoc     ExperimentDoc   `json:"controlDoc"`
 	TreatedDoc     ExperimentDoc   `json:"treatedDoc"`
+}
+
+// StateBasis states exactly which frozen state of a branch a comparison
+// used, so later advances of that branch cannot silently replace the basis
+// of an already opened comparison.
+type StateBasis struct {
+	ExperimentID string `json:"experimentId"`
+	DecisionID   string `json:"decisionId"`
+	Note         string `json:"note"`
 }
 
 func LoadExperimentAtDecision(doc ExperimentDoc, decisionID string) (*Simulator, error) {
@@ -99,11 +111,10 @@ func LoadExperimentControlAtDecision(doc ExperimentDoc, decisionID string, skipA
 }
 
 func ExperimentWithoutAction(doc ExperimentDoc, ref InterventionRef) (ExperimentDoc, Action, error) {
-	out := doc
+	out := CloneDoc(doc)
 	out.ID = ref.ExperimentID + "-control-" + ref.DecisionID + "-" + fmt.Sprint(ref.ActionIndex)
 	out.Name = "control"
 	out.ReadOnly = true
-	out.Decisions = append([]Decision(nil), doc.Decisions...)
 	var removed Action
 	found := false
 	for i := range out.Decisions {

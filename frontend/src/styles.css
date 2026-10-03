@@ -58,3 +58,6 @@ th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
 .analysis-links a { color: #93c5fd; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .branch-grid { grid-template-columns: 1fr; } }
+.notice { background: #14532d; padding: 10px; border-radius: 8px; margin: 8px 0; }
+.fork-origin { color: #9ca3af; font-size: 12px; margin: 4px 0; }
+.analysis-basis { color: #9ca3af; font-size: 13px; margin: 6px 0; padding-left: 18px; }
