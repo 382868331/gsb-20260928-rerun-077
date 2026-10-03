@@ -25,10 +25,15 @@ function fallbackState(state: State | null): State {
   return state ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
 }
 
+function formatSelector(selector: Selector): string {
+  return [selector.type, `${selector.from ?? '?'}→${selector.to ?? '?'}`, `term ${selector.term ?? '?'}`].join(' ');
+}
+
 export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, onError }: Props) {
   const [ticks, setTicks] = useState(100);
   const [groups, setGroups] = useState('1,2\n3,4,5');
   const state = fallbackState(experiment.state);
+  const decisions = experiment.decisions ?? [];
 
   const run = async (promise: Promise<ExperimentView>) => {
     try {
@@ -49,6 +54,11 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
         <h3>{title}（实验 {experiment.id}）</h3>
         <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}{experiment.readOnly ? ' · 只读对照' : ''}</span>
       </header>
+      {experiment.sourcePause && (
+        <div className="source-pause">
+          来源暂停状态：t {experiment.sourceAt ?? state.now} · {formatSelector(experiment.sourcePause)}
+        </div>
+      )}
       {experiment.loadError && <div className="error" role="alert">{experiment.loadError}</div>}
       <div className="branch-controls">
         <label>推进 <input type="number" value={ticks} onChange={(e) => setTicks(Number(e.target.value))} /></label>
@@ -95,9 +105,9 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
           ))}
         </tbody>
       </table>
-      <h4>分支决策追溯（{experiment.decisions.length}）</h4>
+      <h4>分支决策追溯（{decisions.length}）</h4>
       <ol className="decisions">
-        {experiment.decisions.map((decision) => (
+        {decisions.map((decision) => (
           <li key={decision.id} id={`decision-${experiment.id}-${decision.id}`}>t {decision.at} · {decision.label}
             <ul>
               {decision.actions.map((action, i) => (

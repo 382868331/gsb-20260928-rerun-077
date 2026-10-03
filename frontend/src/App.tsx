@@ -295,15 +295,16 @@ export default function App() {
           <ErrorBoundary onError={setError}>
             <div className="branch-grid">
               {branchList.map((experiment) => (
-                <BranchPanel
-                  key={experiment.id}
+                <ErrorBoundary key={experiment.id} onError={setError}>
+                  <BranchPanel
                     title={experiment.loadError ? '保留的损坏记录' : experiment.name === 'a' ? '实验 A' : '实验 B'}
-                  experiment={experiment}
-                  pairId={pairedBranch(experiment)}
-                  onChange={updateBranch}
-                  onAnalyze={analyzeIntervention}
-                  onError={setError}
-                />
+                    experiment={experiment}
+                    pairId={pairedBranch(experiment)}
+                    onChange={updateBranch}
+                    onAnalyze={analyzeIntervention}
+                    onError={setError}
+                  />
+                </ErrorBoundary>
               ))}
             </div>
           </ErrorBoundary>
@@ -338,6 +339,15 @@ export default function App() {
               <div className="analysis-messages">
                 <span>A：{formatMessage(analysis.messageA)}</span>
                 <span>B：{formatMessage(analysis.messageB)}</span>
+              </div>
+              <div className="analysis-frozen">
+                比较依据（建立分析时冻结，不随分支继续推进而改变）：
+                A 冻结于决定 {analysis.firstDecisionA.id}（t {analysis.firstDecisionA.at}）
+                {analysis.treatedState && `，干预侧快照 t ${analysis.treatedState.now}`}
+                ；B 冻结于决定 {analysis.firstDecisionB.id}（t {analysis.firstDecisionB.at}）
+                {analysis.oppositeState && `，对侧快照 t ${analysis.oppositeState.now}`}
+                {analysis.controlState && `；对照（移除所选干预）快照 t ${analysis.controlState.now}`}
+                。
               </div>
               <div className="analysis-links">
                 <a href={`#decision-${analysis.experimentAId}-${analysis.firstDecisionA.id}`}>回到 A 的对应消息和节点记录</a>

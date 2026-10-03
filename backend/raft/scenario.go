@@ -49,6 +49,12 @@ type ExperimentDoc struct {
 	Decisions []Decision `json:"decisions"`
 	CreatedAt string     `json:"createdAt"`
 	ReadOnly  bool       `json:"readOnly,omitempty"`
+	// SourcePause, SourceAt and ForkKey record exactly which frozen pause
+	// state a fork request started from, so a retried request is recognized
+	// as the same operation instead of spawning look-alike branches.
+	SourcePause *Selector `json:"sourcePause,omitempty"`
+	SourceAt    int64     `json:"sourceAt,omitempty"`
+	ForkKey     string    `json:"forkKey,omitempty"`
 }
 
 type Scenario struct {

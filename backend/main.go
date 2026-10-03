@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -109,6 +111,33 @@ func (lab *Lab) saveAnalysisLocked(analysis *raft.DivergenceAnalysis) error {
 	return atomicWriteJSON(analysisDir, analysis.ID, analysis)
 }
 
+// forkRequestKey identifies one fork operation: the frozen pause state it
+// started from (prefix actions, pause selector and clock). Retrying the
+// same request maps to the same key, so no look-alike branches appear.
+func forkRequestKey(base raft.Scenario, selector raft.Selector, at int64) string {
+	sum := sha1.Sum(append(raft.MustJSON(base), raft.MustJSON(selector)...))
+	return fmt.Sprintf("%x-%d", hex.EncodeToString(sum[:8]), at)
+}
+
+// findForkPairLocked returns the existing a/b pair previously created by
+// the same fork request, or nil when this request is new.
+func (lab *Lab) findForkPairLocked(key string) (*experiment, *experiment) {
+	for _, exp := range lab.experiments {
+		if exp.doc.Name != "a" || exp.doc.ForkKey != key || exp.loadErr != "" {
+			continue
+		}
+		var other *experiment
+		for _, candidate := range lab.experiments {
+			if candidate.doc.Name == "b" && candidate.doc.ForkKey == key && candidate.loadErr == "" {
+				other = candidate
+				break
+			}
+		}
+		return exp, other
+	}
+	return nil, nil
+}
+
 func (lab *Lab) loadExperiments() {
 	lab.experiments = map[string]*experiment{}
 	entries, err := os.ReadDir(experimentDir)
@@ -173,6 +202,11 @@ type experimentView struct {
 
 func (exp *experiment) view() experimentView {
 	view := experimentView{ExperimentDoc: exp.doc, LoadError: exp.loadErr}
+	if view.Decisions == nil {
+		// Never emit null: the UI reads decisions as a list and a null
+		// here used to crash the whole comparison region.
+		view.Decisions = []raft.Decision{}
+	}
 	if exp.sim != nil {
 		state := exp.sim.Snapshot(300)
 		view.State = &state
@@ -435,6 +469,16 @@ func (lab *Lab) routes() *http.ServeMux {
 		base.Actions = append(base.Actions, raft.Action{
 			Op: "advance", At: lab.sim.Now(), Delay: 1 << 40,
 		})
+		forkKey := forkRequestKey(base, body.Selector, lab.sim.Now())
+		if existingA, existingB := lab.findForkPairLocked(forkKey); existingA != nil && existingB != nil {
+			// Retry of a fork that already succeeded: return the original
+			// pair instead of creating look-alike branches.
+			viewA := existingA.view()
+			viewB := existingB.view()
+			lab.mu.Unlock()
+			writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+			return
+		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		makeBranch := func(name string) *experiment {
 			stamp := strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -442,11 +486,16 @@ func (lab *Lab) routes() *http.ServeMux {
 			for suffix := 1; lab.experiments[id] != nil; suffix++ {
 				id = fmt.Sprintf("exp-%s-%s-%d", stamp, name, suffix)
 			}
+			sourcePause := body.Selector
 			doc := raft.ExperimentDoc{
-				ID:        id,
-				Name:      name,
-				Base:      base,
-				CreatedAt: now,
+				ID:          id,
+				Name:        name,
+				Base:        base,
+				Decisions:   []raft.Decision{},
+				CreatedAt:   now,
+				SourcePause: &sourcePause,
+				SourceAt:    lab.sim.Now(),
+				ForkKey:     forkKey,
 			}
 			// Clone the live simulator at the pause point: both branches share
 			// the exact same prefix and then diverge independently.

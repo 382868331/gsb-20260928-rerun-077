@@ -96,6 +96,9 @@ export interface ExperimentDoc {
   decisions: Decision[];
   createdAt: string;
   readOnly?: boolean;
+  sourcePause?: Selector | null;
+  sourceAt?: number;
+  forkKey?: string;
 }
 
 export interface InterventionRef {

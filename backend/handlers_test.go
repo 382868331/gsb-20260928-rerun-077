@@ -113,3 +113,82 @@ func TestForkedExperimentsPersistAndReload(t *testing.T) {
 		t.Fatalf("branch A decision trace lost: %+v", gotA.doc.Decisions)
 	}
 }
+
+func armPauseAndFork(t *testing.T, lab *Lab, mux *http.ServeMux) *httptest.ResponseRecorder {
+	t.Helper()
+	lab.sim.Advance(30)
+	pending := lab.sim.PendingMessages()
+	if len(pending) == 0 {
+		t.Fatal("no queued messages to pause on")
+	}
+	target := pending[0]
+	sel := raft.Selector{Type: target.Type, From: target.From, To: target.To, Term: target.Term}
+	lab.sim.ArmPause(sel)
+	lab.sim.Advance(1 << 40)
+	if !lab.sim.Paused() {
+		t.Fatal("live simulator did not pause before selected delivery")
+	}
+	raw, _ := json.Marshal(map[string]any{"selector": sel})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/fork", bytes.NewReader(raw)))
+	return rec
+}
+
+func TestForkEmitsEmptyDecisionListNotNull(t *testing.T) {
+	lab := newTestLab(t)
+	mux := lab.routes()
+	rec := armPauseAndFork(t, lab, mux)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fork failed: %s", rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("\"decisions\":null")) {
+		t.Fatal("fresh fork serializes decisions as null and crashes the comparison UI")
+	}
+}
+
+func TestForkRetryReturnsSamePair(t *testing.T) {
+	lab := newTestLab(t)
+	mux := lab.routes()
+	first := armPauseAndFork(t, lab, mux)
+	if first.Code != http.StatusOK {
+		t.Fatalf("fork failed: %s", first.Body.String())
+	}
+	var pair1, pair2 map[string]experimentView
+	if err := json.Unmarshal(first.Body.Bytes(), &pair1); err != nil {
+		t.Fatal(err)
+	}
+	// Retrying the identical fork request must not mint look-alike branches.
+	// The main simulator is still paused at the same point, so the retry
+	// carries the identical source state.
+	raw, _ := json.Marshal(map[string]any{"selector": pair1["a"].SourcePause})
+	second := httptest.NewRecorder()
+	mux.ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/fork", bytes.NewReader(raw)))
+	if err := json.Unmarshal(second.Body.Bytes(), &pair2); err != nil {
+		t.Fatal(err)
+	}
+	if pair1["a"].ID != pair2["a"].ID || pair1["b"].ID != pair2["b"].ID {
+		t.Fatalf("retry created new pair %s/%s, want original %s/%s",
+			pair2["a"].ID, pair2["b"].ID, pair1["a"].ID, pair1["b"].ID)
+	}
+	if len(lab.experiments) != 2 {
+		t.Fatalf("retry left %d experiments, want 2", len(lab.experiments))
+	}
+	if pair1["a"].SourcePause == nil || pair1["a"].ForkKey == "" {
+		t.Fatal("fork did not record its source pause state")
+	}
+
+	// After a restart the original request's products are still recognized:
+	// the same retry still maps to the persisted pair.
+	restarted := &Lab{sim: lab.sim, scenario: lab.scenario, experiments: map[string]*experiment{}}
+	restarted.loadExperiments()
+	restartedMux := restarted.routes()
+	third := httptest.NewRecorder()
+	restartedMux.ServeHTTP(third, httptest.NewRequest(http.MethodPost, "/api/fork", bytes.NewReader(raw)))
+	var pair3 map[string]experimentView
+	if err := json.Unmarshal(third.Body.Bytes(), &pair3); err != nil {
+		t.Fatal(err)
+	}
+	if pair3["a"].ID != pair1["a"].ID || pair3["b"].ID != pair1["b"].ID {
+		t.Fatalf("post-restart retry created new pair %s/%s", pair3["a"].ID, pair3["b"].ID)
+	}
+}
