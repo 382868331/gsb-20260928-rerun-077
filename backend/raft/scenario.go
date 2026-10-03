@@ -55,6 +55,11 @@ type ExperimentDoc struct {
 	SourcePause *Selector `json:"sourcePause,omitempty"`
 	SourceAt    int64     `json:"sourceAt,omitempty"`
 	ForkKey     string    `json:"forkKey,omitempty"`
+	// PairCancelled marks a branch whose fork pair was deliberately
+	// cancelled after the other side was lost. The branch keeps its own
+	// recorded history untouched; it only stops claiming the pause point,
+	// so a fresh fork there gets a new, explicit identity.
+	PairCancelled bool `json:"pairCancelled,omitempty"`
 }
 
 type Scenario struct {

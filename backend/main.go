@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -9,8 +10,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,12 +26,25 @@ type Lab struct {
 	scenario    raft.Scenario
 	experiments map[string]*experiment
 	analyses    map[string]*raft.DivergenceAnalysis
+	recoveries  map[string]*recoverySession
+}
+
+// recoverySession is a pending fork-pair recovery: the preview has been
+// shown and the pair stays in "recovering" state until the user confirms
+// (repair or cancel) with this token. Confirmations are idempotent per
+// token, so a retried request cannot mint a second outcome.
+type recoverySession struct {
+	token     string
+	forkKey   string
+	createdAt string
+	result    *recoveryResult
 }
 
 type experiment struct {
 	doc     raft.ExperimentDoc
 	sim     *raft.Simulator
 	loadErr string
+	file    string
 }
 
 const (
@@ -104,7 +120,11 @@ func atomicWriteJSON(dir, name string, value any) (err error) {
 }
 
 func (lab *Lab) saveExperimentLocked(exp *experiment) error {
-	return atomicWriteJSON(experimentDir, exp.doc.ID, exp.doc)
+	if err := atomicWriteJSON(experimentDir, exp.doc.ID, exp.doc); err != nil {
+		return err
+	}
+	exp.file = exp.doc.ID + ".json"
+	return nil
 }
 
 func (lab *Lab) saveAnalysisLocked(analysis *raft.DivergenceAnalysis) error {
@@ -119,23 +139,270 @@ func forkRequestKey(base raft.Scenario, selector raft.Selector, at int64) string
 	return fmt.Sprintf("%x-%d", hex.EncodeToString(sum[:8]), at)
 }
 
-// findForkPairLocked returns the existing a/b pair previously created by
-// the same fork request, or nil when this request is new.
-func (lab *Lab) findForkPairLocked(key string) (*experiment, *experiment) {
+// Pair statuses: every fork operation owns exactly one identity (its
+// forkKey), and the remnants on disk always resolve to one of these.
+const (
+	pairComplete   = "complete"   // both sides present and rebuildable
+	pairPartial    = "partial"    // one side was never written (partial write)
+	pairUnreadable = "unreadable" // one side's record is corrupt or unloadable
+	pairRecovering = "recovering" // a recovery preview is pending confirmation
+	pairCancelled  = "cancelled"  // incomplete fork cancelled; pause point released
+)
+
+type forkPairSide struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Healthy   bool   `json:"healthy"`
+	LoadError string `json:"loadError,omitempty"`
+	Decisions int    `json:"decisions"`
+}
+
+type forkPairView struct {
+	ForkKey     string         `json:"forkKey"`
+	Status      string         `json:"status"`
+	SourcePause *raft.Selector `json:"sourcePause,omitempty"`
+	SourceAt    int64          `json:"sourceAt,omitempty"`
+	Sides       []forkPairSide `json:"sides"`
+	Missing     string         `json:"missing,omitempty"`
+}
+
+// forkPairStatusLocked resolves one fork identity to its current persisted
+// state, including corrupt and half-written remnants. It returns nil when
+// the pause point has never produced (or no longer claims) a pair.
+func (lab *Lab) forkPairStatusLocked(key string) *forkPairView {
+	view := &forkPairView{ForkKey: key, Status: pairComplete, Sides: []forkPairSide{}}
+	var healthyA, healthyB *experiment
+	broken := map[string]*experiment{}
+	cancelled := false
 	for _, exp := range lab.experiments {
-		if exp.doc.Name != "a" || exp.doc.ForkKey != key || exp.loadErr != "" {
+		if exp.doc.ForkKey != key {
 			continue
 		}
-		var other *experiment
-		for _, candidate := range lab.experiments {
-			if candidate.doc.Name == "b" && candidate.doc.ForkKey == key && candidate.loadErr == "" {
-				other = candidate
-				break
-			}
+		if exp.doc.PairCancelled {
+			cancelled = true
 		}
-		return exp, other
+		name := exp.doc.Name
+		if name != "a" && name != "b" {
+			name = "?"
+		}
+		side := forkPairSide{ID: exp.doc.ID, Name: name, Healthy: exp.loadErr == "", LoadError: exp.loadErr, Decisions: len(exp.doc.Decisions)}
+		view.Sides = append(view.Sides, side)
+		if view.SourcePause == nil && exp.doc.SourcePause != nil {
+			view.SourcePause = exp.doc.SourcePause
+			view.SourceAt = exp.doc.SourceAt
+		}
+		if exp.loadErr != "" {
+			broken[name] = exp
+			continue
+		}
+		switch name {
+		case "a":
+			healthyA = exp
+		case "b":
+			healthyB = exp
+		}
 	}
-	return nil, nil
+	if len(view.Sides) == 0 {
+		return nil
+	}
+	sort.Slice(view.Sides, func(i, j int) bool { return view.Sides[i].ID < view.Sides[j].ID })
+	switch {
+	case cancelled:
+		view.Status = pairCancelled
+	case healthyA != nil && healthyB != nil:
+		view.Status = pairComplete
+	case lab.recoveries != nil && lab.recoveries[key] != nil && lab.recoveries[key].result == nil:
+		view.Status = pairRecovering
+	case len(broken) > 0:
+		view.Status = pairUnreadable
+	default:
+		view.Status = pairPartial
+	}
+	if healthyA == nil {
+		view.Missing = "a"
+	}
+	if healthyB == nil {
+		view.Missing = "b"
+	}
+	return view
+}
+
+// listForkPairsLocked groups every experiment that carries a fork identity
+// into auditable pair views, including damaged and cancelled ones.
+func (lab *Lab) listForkPairsLocked() []forkPairView {
+	keys := map[string]bool{}
+	for _, exp := range lab.experiments {
+		if exp.doc.ForkKey != "" {
+			keys[exp.doc.ForkKey] = true
+		}
+	}
+	pairs := []forkPairView{}
+	for key := range keys {
+		if view := lab.forkPairStatusLocked(key); view != nil {
+			pairs = append(pairs, *view)
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ForkKey < pairs[j].ForkKey })
+	return pairs
+}
+
+type recoveryPreview struct {
+	Pair          forkPairView `json:"pair"`
+	Token         string       `json:"token"`
+	KeepSide      string       `json:"keepSide"`
+	KeepDecisions int          `json:"keepDecisions"`
+	RepairSide    string       `json:"repairSide"`
+	RepairID      string       `json:"repairId"`
+	Actions       []string     `json:"actions"`
+	Summary       string       `json:"summary"`
+}
+
+type recoveryResult struct {
+	Pair     forkPairView    `json:"pair"`
+	Repaired *experimentView `json:"repaired,omitempty"`
+	Message  string          `json:"message"`
+}
+
+// healthySideLocked returns the rebuildable a/b side of a pair, if any.
+func (lab *Lab) healthySideLocked(key string) *experiment {
+	for _, exp := range lab.experiments {
+		if exp.doc.ForkKey == key && exp.loadErr == "" && !exp.doc.PairCancelled &&
+			(exp.doc.Name == "a" || exp.doc.Name == "b") {
+			return exp
+		}
+	}
+	return nil
+}
+
+// buildPreviewLocked describes the planned recovery without changing
+// anything: which side and how many recorded decisions are preserved, and
+// which side identity a repair would recreate.
+func (lab *Lab) buildPreviewLocked(pair *forkPairView, token string) recoveryPreview {
+	preview := recoveryPreview{Pair: *pair, Token: token, Actions: []string{"repair", "cancel"}}
+	keep := lab.healthySideLocked(pair.ForkKey)
+	if keep != nil {
+		preview.KeepSide = keep.doc.ID
+		preview.KeepDecisions = len(keep.doc.Decisions)
+	}
+	missing := pair.Missing
+	if missing == "" {
+		missing = "b"
+	}
+	preview.RepairSide = missing
+	preview.RepairID = lab.repairIDLocked(pair, missing)
+	preview.Summary = fmt.Sprintf("保留侧 %s（已记录 %d 条决定，历史不变）；修复将按共同前缀与来源暂停状态重建 %s 侧为 %s，或取消该分叉并保留现有分支。",
+		preview.KeepSide, preview.KeepDecisions, missing, preview.RepairID)
+	return preview
+}
+
+// repairIDLocked picks the deterministic identity for the recreated side:
+// the corrupt record's own id when one exists, otherwise a stable id
+// derived from the fork key, so repeated repairs converge on one record.
+func (lab *Lab) repairIDLocked(pair *forkPairView, side string) string {
+	for _, exp := range lab.experiments {
+		if exp.doc.ForkKey == pair.ForkKey && exp.doc.Name == side && exp.loadErr != "" {
+			return strings.TrimSuffix(exp.file, ".json")
+		}
+	}
+	return "exp-" + pair.ForkKey + "-" + side
+}
+
+// repairPairLocked recreates the missing or unreadable side of a pair from
+// the surviving side's persisted base scenario and source pause state. The
+// surviving branch is never touched, so its executed history and the shared
+// prefix stay exactly as recorded.
+func (lab *Lab) repairPairLocked(key string) (*recoveryResult, error) {
+	pair := lab.forkPairStatusLocked(key)
+	if pair == nil {
+		return nil, fmt.Errorf("配对不存在")
+	}
+	if pair.Status == pairComplete {
+		return &recoveryResult{Pair: *pair, Message: "配对已完整，无需修复"}, nil
+	}
+	keep := lab.healthySideLocked(key)
+	if keep == nil {
+		return nil, fmt.Errorf("两侧记录都无法重建，缺少可核对的来源快照，不能修复")
+	}
+	side := pair.Missing
+	if side == "" {
+		side = "b"
+	}
+	repairID := lab.repairIDLocked(pair, side)
+	if existing := lab.experiments[repairID]; existing != nil && existing.loadErr == "" {
+		// A previous repair already landed: report it instead of duplicating.
+		fresh := lab.forkPairStatusLocked(key)
+		return &recoveryResult{Pair: *fresh, Message: "该侧已修复，重复请求未产生新记录"}, nil
+	}
+	doc := raft.ExperimentDoc{
+		ID:          repairID,
+		Name:        side,
+		Base:        keep.doc.Base,
+		Decisions:   []raft.Decision{},
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+		SourcePause: keep.doc.SourcePause,
+		SourceAt:    keep.doc.SourceAt,
+		ForkKey:     key,
+	}
+	sim, err := raft.LoadExperiment(doc)
+	if err != nil {
+		return nil, fmt.Errorf("无法按共同前缀重建缺失侧：%v", err)
+	}
+	repaired := &experiment{doc: doc, sim: sim}
+	if err := lab.saveExperimentLocked(repaired); err != nil {
+		return nil, fmt.Errorf("修复侧保存失败，现有记录未改动：%v", err)
+	}
+	// Drop the damaged remnants of the repaired side (files and memory);
+	// every other experiment, including the surviving branch, is untouched.
+	for id, exp := range lab.experiments {
+		if exp.doc.ForkKey == key && exp.doc.Name == side && exp.loadErr != "" {
+			if exp.file != "" && exp.file != repaired.file {
+				_ = os.Remove(filepath.Join(experimentDir, exp.file))
+			}
+			delete(lab.experiments, id)
+		}
+	}
+	lab.experiments[doc.ID] = repaired
+	fresh := lab.forkPairStatusLocked(key)
+	view := repaired.view()
+	return &recoveryResult{Pair: *fresh, Repaired: &view, Message: fmt.Sprintf("已修复 %s 侧为 %s；保留侧 %s 的 %d 条决定与共同前缀均未改动。", side, doc.ID, keep.doc.ID, len(keep.doc.Decisions))}, nil
+}
+
+// cancelPairLocked dissolves an incomplete fork: the surviving branch keeps
+// its full recorded history and is only marked as no longer claiming the
+// pause point, so a later fork there gets a fresh, explicit identity.
+func (lab *Lab) cancelPairLocked(key string) (*recoveryResult, error) {
+	pair := lab.forkPairStatusLocked(key)
+	if pair == nil {
+		return nil, fmt.Errorf("配对不存在")
+	}
+	if pair.Status == pairCancelled {
+		return &recoveryResult{Pair: *pair, Message: "该分叉已取消，重复请求未改动任何记录"}, nil
+	}
+	if pair.Status == pairComplete {
+		return nil, fmt.Errorf("配对完整，不能取消；如需重来请直接在新暂停点分叉")
+	}
+	keep := lab.healthySideLocked(key)
+	if keep != nil {
+		keep.doc.PairCancelled = true
+		if err := lab.saveExperimentLocked(keep); err != nil {
+			return nil, fmt.Errorf("取消标记保存失败，现有记录未改动：%v", err)
+		}
+	}
+	// Remove only the unreadable remnants of the lost side; the surviving
+	// branch file and its decisions stay byte-identical except the flag.
+	for id, exp := range lab.experiments {
+		if exp.doc.ForkKey == key && exp.loadErr != "" {
+			if exp.file != "" {
+				_ = os.Remove(filepath.Join(experimentDir, exp.file))
+			}
+			delete(lab.experiments, id)
+		}
+	}
+	fresh := lab.forkPairStatusLocked(key)
+	if fresh == nil {
+		fresh = &forkPairView{ForkKey: key, Status: pairCancelled, Sides: []forkPairSide{}}
+	}
+	return &recoveryResult{Pair: *fresh, Message: "已取消该未完成分叉；保留分支历史不变，该暂停点可重新分叉。"}, nil
 }
 
 func (lab *Lab) loadExperiments() {
@@ -155,8 +422,22 @@ func (lab *Lab) loadExperiments() {
 		var doc raft.ExperimentDoc
 		if err := json.Unmarshal(raw, &doc); err != nil {
 			log.Printf("keep unreadable experiment %s: %v", entry.Name(), err)
+			broken := raft.ExperimentDoc{ID: entry.Name(), Name: "unreadable"}
+			// Best-effort identity recovery: even a corrupt record still
+			// claims its fork pair, so the pause point cannot silently
+			// mint a second pair while this remnant exists.
+			if id, name, key := extractForkIdentity(raw); key != "" {
+				broken.ForkKey = key
+				if name == "a" || name == "b" {
+					broken.Name = name
+				}
+				if id != "" {
+					broken.ID = id
+				}
+			}
 			lab.experiments[entry.Name()] = &experiment{
-				doc:     raft.ExperimentDoc{ID: entry.Name(), Name: "unreadable"},
+				doc:     broken,
+				file:    entry.Name(),
 				loadErr: fmt.Sprintf("实验记录 JSON 已损坏：%v；其他实验仍保留。", err),
 			}
 			continue
@@ -164,11 +445,33 @@ func (lab *Lab) loadExperiments() {
 		sim, err := raft.LoadExperiment(doc)
 		if err != nil {
 			log.Printf("keep unloadable experiment %s: %v", entry.Name(), err)
-			lab.experiments[doc.ID] = &experiment{doc: doc, loadErr: fmt.Sprintf("实验无法重建：%v；已保留暂停点和已保存操作。", err)}
+			lab.experiments[doc.ID] = &experiment{doc: doc, file: entry.Name(), loadErr: fmt.Sprintf("实验无法重建：%v；已保留暂停点和已保存操作。", err)}
 			continue
 		}
-		lab.experiments[doc.ID] = &experiment{doc: doc, sim: sim}
+		lab.experiments[doc.ID] = &experiment{doc: doc, sim: sim, file: entry.Name()}
 	}
+}
+
+var (
+	forkIDPattern   = regexp.MustCompile(`"id"\s*:\s*"([^"]+)"`)
+	forkNamePattern = regexp.MustCompile(`"name"\s*:\s*"([ab])"`)
+	forkKeyPattern  = regexp.MustCompile(`"forkKey"\s*:\s*"([^"]+)"`)
+)
+
+// extractForkIdentity salvages the pair identity fields from a record
+// whose JSON no longer parses, so a corrupt file still counts as a
+// remnant of its fork operation instead of an invisible orphan.
+func extractForkIdentity(raw []byte) (id, name, key string) {
+	if match := forkIDPattern.FindSubmatch(raw); match != nil {
+		id = string(match[1])
+	}
+	if match := forkNamePattern.FindSubmatch(raw); match != nil {
+		name = string(match[1])
+	}
+	if match := forkKeyPattern.FindSubmatch(raw); match != nil {
+		key = string(match[1])
+	}
+	return id, name, key
 }
 
 func (lab *Lab) loadAnalyses() {
@@ -470,13 +773,50 @@ func (lab *Lab) routes() *http.ServeMux {
 			Op: "advance", At: lab.sim.Now(), Delay: 1 << 40,
 		})
 		forkKey := forkRequestKey(base, body.Selector, lab.sim.Now())
-		if existingA, existingB := lab.findForkPairLocked(forkKey); existingA != nil && existingB != nil {
-			// Retry of a fork that already succeeded: return the original
-			// pair instead of creating look-alike branches.
-			viewA := existingA.view()
-			viewB := existingB.view()
+		// A cancelled pair no longer claims its identity: the next fork at
+		// the same pause point gets the next generation of the key, so old
+		// and new operations never share an identity silently. The mapping
+		// is deterministic given the persisted records, so restarts and
+		// retries still converge on the same key.
+		for generation := 2; ; generation++ {
+			pair := lab.forkPairStatusLocked(forkKey)
+			if pair == nil {
+				break
+			}
+			if pair.Status != pairCancelled {
+				break
+			}
+			forkKey = fmt.Sprintf("%s#g%d", forkRequestKey(base, body.Selector, lab.sim.Now()), generation)
+		}
+		if pair := lab.forkPairStatusLocked(forkKey); pair != nil {
+			// This pause point already owns a fork identity. A complete
+			// pair is returned as-is (idempotent retry); any damaged or
+			// half-written remnant blocks silent re-forking and must go
+			// through the explicit recovery flow instead.
+			if pair.Status == pairComplete {
+				pairA := lab.healthySideLocked(forkKey)
+				var pairB *experiment
+				for _, exp := range lab.experiments {
+					if exp.doc.ForkKey == forkKey && exp.loadErr == "" && exp != pairA {
+						pairB = exp
+					}
+				}
+				viewA := pairA.view()
+				viewB := pairB.view()
+				lab.mu.Unlock()
+				if pairA.doc.Name == "a" {
+					writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+				} else {
+					writeJSON(w, map[string]experimentView{"a": viewB, "b": viewA})
+				}
+				return
+			}
 			lab.mu.Unlock()
-			writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]any{
+				"error": "该暂停点已有一对分叉（状态：" + pair.Status + "），不能静默生成第二对；请在配对恢复中选择修复缺失侧或取消该分叉。",
+				"pair":  pair,
+			})
 			return
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
@@ -550,6 +890,92 @@ func (lab *Lab) routes() *http.ServeMux {
 			return
 		}
 		writeJSON(w, view)
+	}))
+	mux.HandleFunc("GET /api/fork-pairs", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		lab.mu.Lock()
+		pairs := lab.listForkPairsLocked()
+		lab.mu.Unlock()
+		writeJSON(w, pairs)
+	}))
+	mux.HandleFunc("POST /api/fork-recovery/preview", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ForkKey string `json:"forkKey"`
+		}
+		if err := decode(r, &body); err != nil || body.ForkKey == "" {
+			http.Error(w, "forkKey required", http.StatusBadRequest)
+			return
+		}
+		lab.mu.Lock()
+		defer lab.mu.Unlock()
+		pair := lab.forkPairStatusLocked(body.ForkKey)
+		if pair == nil {
+			http.Error(w, "未找到该分叉配对", http.StatusNotFound)
+			return
+		}
+		if pair.Status == pairComplete || pair.Status == pairCancelled {
+			http.Error(w, "该配对无需恢复（当前状态："+pair.Status+"）", http.StatusConflict)
+			return
+		}
+		// Re-requesting a preview for a pair already in recovery returns the
+		// same pending session instead of stacking a second operation.
+		if session := lab.recoveries[body.ForkKey]; session != nil && session.result == nil {
+			pair.Status = pairRecovering
+			writeJSON(w, lab.buildPreviewLocked(pair, session.token))
+			return
+		}
+		tokenBytes := make([]byte, 8)
+		if _, err := rand.Read(tokenBytes); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		token := hex.EncodeToString(tokenBytes)
+		if lab.recoveries == nil {
+			lab.recoveries = map[string]*recoverySession{}
+		}
+		lab.recoveries[body.ForkKey] = &recoverySession{token: token, forkKey: body.ForkKey, createdAt: time.Now().UTC().Format(time.RFC3339)}
+		pair.Status = pairRecovering
+		writeJSON(w, lab.buildPreviewLocked(pair, token))
+	}))
+	mux.HandleFunc("POST /api/fork-recovery/confirm", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			ForkKey string `json:"forkKey"`
+			Token   string `json:"token"`
+			Action  string `json:"action"` // "repair" or "cancel"
+		}
+		if err := decode(r, &body); err != nil || body.ForkKey == "" || body.Token == "" {
+			http.Error(w, "forkKey、token 和 action 均为必填", http.StatusBadRequest)
+			return
+		}
+		if body.Action != "repair" && body.Action != "cancel" {
+			http.Error(w, "action 只能是 repair 或 cancel", http.StatusBadRequest)
+			return
+		}
+		lab.mu.Lock()
+		defer lab.mu.Unlock()
+		session := lab.recoveries[body.ForkKey]
+		if session == nil || session.token != body.Token {
+			http.Error(w, "恢复会话不存在或已失效，请重新预览", http.StatusConflict)
+			return
+		}
+		// Duplicate confirm with the same token replays the recorded outcome
+		// instead of applying the recovery a second time.
+		if session.result != nil {
+			writeJSON(w, session.result)
+			return
+		}
+		var result *recoveryResult
+		var err error
+		if body.Action == "repair" {
+			result, err = lab.repairPairLocked(body.ForkKey)
+		} else {
+			result, err = lab.cancelPairLocked(body.ForkKey)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		session.result = result
+		writeJSON(w, result)
 	}))
 	mux.HandleFunc("GET /api/analyses", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		lab.mu.Lock()

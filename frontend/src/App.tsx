@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { BranchPanel, messageSelector } from './BranchPanel';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { DivergenceAnalysis, Event, ExperimentView, InterventionRef, NodeView, Scenario, Selector, State } from './types';
+import type { DivergenceAnalysis, Event, ExperimentView, ForkPairView, InterventionRef, NodeView, RecoveryPreview, Scenario, Selector, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -64,6 +64,9 @@ export default function App() {
   const [error, setError] = useState('');
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
   const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
+  const [pairs, setPairs] = useState<ForkPairView[]>([]);
+  const [preview, setPreview] = useState<RecoveryPreview | null>(null);
+  const [recoveryMsg, setRecoveryMsg] = useState('');
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -83,6 +86,7 @@ export default function App() {
       }
       setBranches(next);
       setAnalyses(await api.analyses());
+      setPairs(await api.forkPairs());
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -205,10 +209,45 @@ export default function App() {
   };
 
   const pairedBranch = (experiment: ExperimentView) => {
-    if (experiment.name === 'a') return experiment.id.replace(/-a$/, '-b');
-    if (experiment.name === 'b') return experiment.id.replace(/-b$/, '-a');
-    return '';
+    if (!experiment.forkKey) return '';
+    const other = Object.values(branches).find(
+      (candidate) => candidate.forkKey === experiment.forkKey && candidate.id !== experiment.id && !candidate.loadError,
+    );
+    return other?.id ?? '';
   };
+
+  const startRecovery = async (forkKey: string) => {
+    try {
+      setPreview(await api.recoveryPreview(forkKey));
+      setRecoveryMsg('');
+      setPairs(await api.forkPairs());
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const confirmRecovery = async (action: 'repair' | 'cancel') => {
+    if (!preview) return;
+    try {
+      const result = await api.recoveryConfirm(preview.pair.forkKey, preview.token, action);
+      setRecoveryMsg(result.message);
+      setPreview(null);
+      await loadExperiments();
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const pairStatusText: Record<ForkPairView['status'], string> = {
+    complete: '完整',
+    partial: '部分写入',
+    unreadable: '无法读取',
+    recovering: '正在恢复',
+    cancelled: '已取消',
+  };
+  const abnormalPairs = pairs.filter((pair) => pair.status !== 'complete');
 
   const safeState = (value: State | null): State => value ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
   const branchList = Object.values(branches)
@@ -289,6 +328,50 @@ export default function App() {
         </div>
       </section>
 
+      {abnormalPairs.length > 0 && (
+        <section className="recovery">
+          <h2>分叉配对恢复（同一暂停点不会静默生成第二对分叉）</h2>
+          {recoveryMsg && <div className="recovery-done" role="status">{recoveryMsg}</div>}
+          {abnormalPairs.map((pair) => (
+            <article className={`pair-card pair-${pair.status}`} key={pair.forkKey}>
+              <header>
+                <strong>配对 {pair.forkKey}</strong>
+                <span className="pair-badge">{pairStatusText[pair.status]}</span>
+              </header>
+              <div className="pair-detail">
+                来源暂停状态：t {pair.sourceAt ?? '—'}
+                {pair.sourcePause && ` · ${pair.sourcePause.type} ${pair.sourcePause.from ?? '?'}→${pair.sourcePause.to ?? '?'}`}
+                ；缺失侧：{pair.missing || '—'}
+              </div>
+              <ul className="pair-sides">
+                {pair.sides.map((side) => (
+                  <li key={side.id}>
+                    {side.name} 侧 {side.id}：{side.healthy ? `可重建，已记录 ${side.decisions} 条决定` : `无法读取（${side.loadError ?? '记录损坏'}）`}
+                  </li>
+                ))}
+              </ul>
+              {(pair.status === 'partial' || pair.status === 'unreadable') && (
+                <button onClick={() => startRecovery(pair.forkKey)}>预览恢复方案</button>
+              )}
+              {pair.status === 'recovering' && preview?.pair.forkKey === pair.forkKey && (
+                <div className="recovery-preview">
+                  <p>{preview.summary}</p>
+                  <p>
+                    修复将新建 {preview.repairSide} 侧记录 {preview.repairId}（共同前缀与来源快照来自保留侧，可核对）；
+                    取消则保留 {preview.keepSide} 的全部 {preview.keepDecisions} 条已执行决定，仅解除配对。
+                  </p>
+                  <button onClick={() => confirmRecovery('repair')}>确认修复缺失侧</button>
+                  <button onClick={() => confirmRecovery('cancel')}>确认取消该分叉</button>
+                  <button onClick={() => setPreview(null)}>暂不处理</button>
+                </div>
+              )}
+              {pair.status === 'recovering' && preview?.pair.forkKey !== pair.forkKey && (
+                <button onClick={() => startRecovery(pair.forkKey)}>查看进行中的恢复</button>
+              )}
+            </article>
+          ))}
+        </section>
+      )}
       {branchList.length > 0 && (
         <section className="experiments">
           <h2>实验分支比较（共同前缀一致，队列与计时互相独立；决策已持久化，重开后自动恢复）</h2>

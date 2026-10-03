@@ -56,5 +56,18 @@ th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
 .analysis-messages { display: grid; gap: 4px; margin-bottom: 10px; color: #94a3b8; font-size: 12px; }
 .analysis-links { display: flex; gap: 14px; flex-wrap: wrap; }
 .analysis-links a { color: #93c5fd; }
+.recovery { margin-top: 24px; display: grid; gap: 12px; }
+.pair-card { background: #1e293b; border: 1px solid #b45309; border-radius: 12px; padding: 14px; }
+.pair-card.pair-cancelled { border-color: #475569; }
+.pair-card.pair-recovering { border-color: #0f766e; }
+.pair-card header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.pair-badge { background: #b45309; border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+.pair-cancelled .pair-badge { background: #475569; }
+.pair-recovering .pair-badge { background: #0f766e; }
+.pair-detail { color: #cbd5e1; font-size: 13px; margin-bottom: 6px; }
+.pair-sides { margin: 0 0 10px; padding-left: 18px; color: #94a3b8; font-size: 12px; }
+.recovery-preview { border-top: 1px solid #475569; padding-top: 10px; display: grid; gap: 8px; justify-items: start; }
+.recovery-preview p { margin: 0; color: #cbd5e1; font-size: 13px; }
+.recovery-done { background: #064e3b; border: 1px solid #0f766e; border-radius: 8px; padding: 8px 12px; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .branch-grid { grid-template-columns: 1fr; } }

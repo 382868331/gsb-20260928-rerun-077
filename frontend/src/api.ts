@@ -1,4 +1,4 @@
-import type { DivergenceAnalysis, ExperimentView, InterventionRef, Scenario, Selector, State } from './types';
+import type { DivergenceAnalysis, ExperimentView, ForkPairView, InterventionRef, RecoveryPreview, RecoveryResult, Scenario, Selector, State } from './types';
 
 async function call<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(path, {
@@ -6,7 +6,17 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
     headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) {
+    const text = await response.text();
+    try {
+      const parsed = JSON.parse(text) as { error?: string };
+      if (parsed.error) throw new Error(parsed.error);
+    } catch (err) {
+      if (err instanceof SyntaxError) throw new Error(text);
+      throw err;
+    }
+    throw new Error(text);
+  }
   return response.json();
 }
 
@@ -24,6 +34,10 @@ export const api = {
   armPause: (selector: Selector) => call<State>('/api/arm-pause', { selector }),
   clearPause: () => call<State>('/api/clear-pause'),
   fork: (selector: Selector) => call<{ a: ExperimentView; b: ExperimentView }>('/api/fork', { selector }),
+  forkPairs: () => call<ForkPairView[]>('/api/fork-pairs'),
+  recoveryPreview: (forkKey: string) => call<RecoveryPreview>('/api/fork-recovery/preview', { forkKey }),
+  recoveryConfirm: (forkKey: string, token: string, action: 'repair' | 'cancel') =>
+    call<RecoveryResult>('/api/fork-recovery/confirm', { forkKey, token, action }),
   experiments: () => call<ExperimentView[]>('/api/experiments'),
   analyses: () => call<DivergenceAnalysis[]>('/api/analyses'),
   analyze: (experimentAId: string, experimentBId: string, candidate: InterventionRef) =>

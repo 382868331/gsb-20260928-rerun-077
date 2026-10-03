@@ -52,7 +52,7 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
     <section className="branch">
       <header>
         <h3>{title}（实验 {experiment.id}）</h3>
-        <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}{experiment.readOnly ? ' · 只读对照' : ''}</span>
+        <span>t {state.now}{state.paused ? ' · 已暂停在投递点' : ''}{experiment.readOnly ? ' · 只读对照' : ''}{experiment.pairCancelled ? ' · 配对已取消' : ''}</span>
       </header>
       {experiment.sourcePause && (
         <div className="source-pause">

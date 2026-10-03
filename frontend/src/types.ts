@@ -99,6 +99,43 @@ export interface ExperimentDoc {
   sourcePause?: Selector | null;
   sourceAt?: number;
   forkKey?: string;
+  pairCancelled?: boolean;
+}
+
+export type ForkPairStatus = 'complete' | 'partial' | 'unreadable' | 'recovering' | 'cancelled';
+
+export interface ForkPairSide {
+  id: string;
+  name: string;
+  healthy: boolean;
+  loadError?: string;
+  decisions: number;
+}
+
+export interface ForkPairView {
+  forkKey: string;
+  status: ForkPairStatus;
+  sourcePause?: Selector | null;
+  sourceAt?: number;
+  sides: ForkPairSide[];
+  missing?: string;
+}
+
+export interface RecoveryPreview {
+  pair: ForkPairView;
+  token: string;
+  keepSide: string;
+  keepDecisions: number;
+  repairSide: string;
+  repairId: string;
+  actions: string[];
+  summary: string;
+}
+
+export interface RecoveryResult {
+  pair: ForkPairView;
+  repaired?: ExperimentView;
+  message: string;
 }
 
 export interface InterventionRef {
