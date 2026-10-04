@@ -55,6 +55,9 @@ type ExperimentDoc struct {
 	SourcePause *Selector `json:"sourcePause,omitempty"`
 	SourceAt    int64     `json:"sourceAt,omitempty"`
 	ForkKey     string    `json:"forkKey,omitempty"`
+	// SourceHash binds this record to the fork manifest's frozen base, so
+	// a foreign or tampered record is not silently treated as a pair side.
+	SourceHash string `json:"sourceHash,omitempty"`
 }
 
 type Scenario struct {

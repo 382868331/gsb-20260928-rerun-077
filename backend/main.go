@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +22,7 @@ type Lab struct {
 	scenario    raft.Scenario
 	experiments map[string]*experiment
 	analyses    map[string]*raft.DivergenceAnalysis
+	manifests   map[string]*raft.ForkManifest
 }
 
 type experiment struct {
@@ -34,6 +34,7 @@ type experiment struct {
 const (
 	experimentDir = "experiments"
 	analysisDir   = "analyses"
+	forkDir       = "forks"
 )
 
 type replayRequest struct {
@@ -111,12 +112,203 @@ func (lab *Lab) saveAnalysisLocked(analysis *raft.DivergenceAnalysis) error {
 	return atomicWriteJSON(analysisDir, analysis.ID, analysis)
 }
 
-// forkRequestKey identifies one fork operation: the frozen pause state it
-// started from (prefix actions, pause selector and clock). Retrying the
-// same request maps to the same key, so no look-alike branches appear.
-func forkRequestKey(base raft.Scenario, selector raft.Selector, at int64) string {
-	sum := sha1.Sum(append(raft.MustJSON(base), raft.MustJSON(selector)...))
-	return fmt.Sprintf("%x-%d", hex.EncodeToString(sum[:8]), at)
+func (lab *Lab) saveManifestLocked(manifest *raft.ForkManifest) error {
+	return atomicWriteJSON(forkDir, manifest.ForkKey, manifest)
+}
+
+func (lab *Lab) loadManifests() {
+	lab.manifests = map[string]*raft.ForkManifest{}
+	entries, err := os.ReadDir(forkDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(forkDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var manifest raft.ForkManifest
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			log.Printf("keep unreadable fork manifest %s: %v", entry.Name(), err)
+			continue
+		}
+		lab.manifests[manifest.ForkKey] = &manifest
+	}
+}
+
+func (lab *Lab) ensureManifestsLocked() {
+	if lab.manifests == nil {
+		lab.loadManifests()
+	}
+}
+
+// forkRecovery describes one damaged pair: which side is still healthy
+// (and what it already decided), which side is damaged, and exactly which
+// new record a confirmed recovery would create.
+type forkRecovery struct {
+	HealthySide      string              `json:"healthySide"`
+	HealthyID        string              `json:"healthyId"`
+	HealthyDecisions []raft.Decision     `json:"healthyDecisions"`
+	DamagedSide      string              `json:"damagedSide"`
+	DamagedID        string              `json:"damagedId"`
+	DamagedError     string              `json:"damagedError"`
+	Planned          *raft.ExperimentDoc `json:"planned,omitempty"`
+	Recoverable      bool                `json:"recoverable"`
+	Reason           string              `json:"reason,omitempty"`
+}
+
+type forkView struct {
+	ForkKey     string        `json:"forkKey"`
+	Phase       string        `json:"phase"`
+	SourcePause raft.Selector `json:"sourcePause"`
+	SourceAt    int64         `json:"sourceAt"`
+	BranchAID   string        `json:"branchAId"`
+	BranchBID   string        `json:"branchBId"`
+	CreatedAt   string        `json:"createdAt"`
+	UpdatedAt   string        `json:"updatedAt"`
+	Recovery    *forkRecovery `json:"recovery,omitempty"`
+}
+
+// sideHealth checks whether one branch record is present, readable and
+// genuinely bound to this fork operation's frozen source snapshot.
+func (lab *Lab) sideHealthLocked(manifest *raft.ForkManifest, id string) (*experiment, string) {
+	exp := lab.experiments[id]
+	if exp == nil {
+		exp = lab.experiments[id+".json"]
+	}
+	if exp == nil {
+		return nil, "记录文件缺失"
+	}
+	if exp.loadErr != "" {
+		return nil, exp.loadErr
+	}
+	if exp.sim == nil || exp.doc.ForkKey != manifest.ForkKey || raft.ScenarioHash(exp.doc.Base) != manifest.SourceHash {
+		return nil, "记录与分叉清单不符，不能视为本配对的一侧"
+	}
+	return exp, ""
+}
+
+// classifyLocked inspects a manifest against the loaded experiments and
+// derives the recovery preview. It never mutates anything.
+func (lab *Lab) classifyLocked(manifest *raft.ForkManifest) *forkRecovery {
+	healthyA, errA := lab.sideHealthLocked(manifest, manifest.BranchAID)
+	healthyB, errB := lab.sideHealthLocked(manifest, manifest.BranchBID)
+	switch {
+	case healthyA != nil && healthyB != nil:
+		return &forkRecovery{Recoverable: false, Reason: "两侧记录均完好，无需恢复"}
+	case healthyA == nil && healthyB == nil:
+		return &forkRecovery{Recoverable: false, Reason: "两侧记录都不可用，无法确认健康侧；已保留证据，请人工核对"}
+	}
+	recovery := &forkRecovery{Recoverable: true}
+	var damagedID, damagedName string
+	if healthyA != nil {
+		recovery.HealthySide = "a"
+		recovery.HealthyID = healthyA.doc.ID
+		recovery.HealthyDecisions = healthyA.doc.Decisions
+		damagedID, damagedName = manifest.BranchBID, "b"
+		recovery.DamagedError = errB
+	} else {
+		recovery.HealthySide = "b"
+		recovery.HealthyID = healthyB.doc.ID
+		recovery.HealthyDecisions = healthyB.doc.Decisions
+		damagedID, damagedName = manifest.BranchAID, "a"
+		recovery.DamagedError = errA
+	}
+	if recovery.HealthyDecisions == nil {
+		recovery.HealthyDecisions = []raft.Decision{}
+	}
+	recovery.DamagedSide = damagedName
+	recovery.DamagedID = damagedID
+	sourcePause := manifest.SourcePause
+	// The rebuilt side starts at the shared pause point with an empty
+	// decision list: recovery must never pretend the damaged side
+	// executed decisions that were lost with its record.
+	recovery.Planned = &raft.ExperimentDoc{
+		ID:          damagedID,
+		Name:        damagedName,
+		Base:        manifest.Base,
+		Decisions:   []raft.Decision{},
+		SourcePause: &sourcePause,
+		SourceAt:    manifest.SourceAt,
+		ForkKey:     manifest.ForkKey,
+		SourceHash:  manifest.SourceHash,
+	}
+	return recovery
+}
+
+// refreshPhaseLocked recomputes a non-canceled manifest's phase from the
+// records actually present, persisting the transition when it changes.
+func (lab *Lab) refreshPhaseLocked(manifest *raft.ForkManifest) {
+	if manifest.Phase == raft.ForkPhaseCanceled {
+		return
+	}
+	_, errA := lab.sideHealthLocked(manifest, manifest.BranchAID)
+	_, errB := lab.sideHealthLocked(manifest, manifest.BranchBID)
+	phase := raft.ForkPhasePartial
+	if errA == "" && errB == "" {
+		phase = raft.ForkPhaseComplete
+	}
+	if phase != manifest.Phase {
+		manifest.Phase = phase
+		manifest.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := lab.saveManifestLocked(manifest); err != nil {
+			log.Printf("fork %s: phase refresh failed: %v", manifest.ForkKey, err)
+		}
+	}
+}
+
+// activeManifestLocked returns the newest non-canceled manifest derived
+// from baseKey ("", baseKey, baseKey-r2, ...). Canceled manifests are
+// tombstones: a retried request after cancellation gets a fresh identity.
+func (lab *Lab) activeManifestLocked(baseKey string) (string, *raft.ForkManifest) {
+	bestSuffix := -1
+	var best *raft.ForkManifest
+	for key, manifest := range lab.manifests {
+		suffix, ok := forkKeySuffix(baseKey, key)
+		if !ok || manifest.Phase == raft.ForkPhaseCanceled {
+			continue
+		}
+		if suffix > bestSuffix {
+			bestSuffix = suffix
+			best = manifest
+		}
+	}
+	if best == nil {
+		return "", nil
+	}
+	return best.ForkKey, best
+}
+
+// nextForkKeyLocked mints a fresh operation identity for baseKey when every
+// previous attempt was canceled.
+func (lab *Lab) nextForkKeyLocked(baseKey string) string {
+	maxSuffix := -1
+	for key := range lab.manifests {
+		if suffix, ok := forkKeySuffix(baseKey, key); ok && suffix > maxSuffix {
+			maxSuffix = suffix
+		}
+	}
+	if maxSuffix < 0 {
+		return baseKey
+	}
+	return fmt.Sprintf("%s-r%d", baseKey, maxSuffix+2)
+}
+
+func forkKeySuffix(baseKey, key string) (int, bool) {
+	if key == baseKey {
+		return 0, true
+	}
+	if !strings.HasPrefix(key, baseKey+"-r") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(key[len(baseKey)+2:])
+	if err != nil || n < 2 {
+		return 0, false
+	}
+	return n, true
 }
 
 // findForkPairLocked returns the existing a/b pair previously created by
@@ -146,6 +338,10 @@ func (lab *Lab) loadExperiments() {
 	}
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		if strings.Contains(entry.Name(), ".corrupt-") {
+			// Quarantined damage evidence, not a loadable experiment.
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(experimentDir, entry.Name()))
@@ -460,6 +656,7 @@ func (lab *Lab) routes() *http.ServeMux {
 			return
 		}
 		lab.mu.Lock()
+		lab.ensureManifestsLocked()
 		if !lab.sim.Paused() {
 			lab.mu.Unlock()
 			http.Error(w, "no active pause point; arm one before forking", http.StatusBadRequest)
@@ -469,23 +666,46 @@ func (lab *Lab) routes() *http.ServeMux {
 		base.Actions = append(base.Actions, raft.Action{
 			Op: "advance", At: lab.sim.Now(), Delay: 1 << 40,
 		})
-		forkKey := forkRequestKey(base, body.Selector, lab.sim.Now())
-		if existingA, existingB := lab.findForkPairLocked(forkKey); existingA != nil && existingB != nil {
-			// Retry of a fork that already succeeded: return the original
-			// pair instead of creating look-alike branches.
-			viewA := existingA.view()
-			viewB := existingB.view()
+		baseKey := raft.ForkRequestKey(base, body.Selector, lab.sim.Now())
+		if forkKey, manifest := lab.activeManifestLocked(baseKey); manifest != nil {
+			if existingA, existingB := lab.findForkPairLocked(forkKey); existingA != nil && existingB != nil {
+				// Retry of a fork that already succeeded: return the original
+				// pair instead of creating look-alike branches.
+				viewA := existingA.view()
+				viewB := existingB.view()
+				lab.mu.Unlock()
+				writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+				return
+			}
+			// The operation exists but its pair is incomplete (damaged or
+			// missing side). Never mint look-alike branches: direct the
+			// user to the recovery preview instead.
 			lab.mu.Unlock()
-			writeJSON(w, map[string]experimentView{"a": viewA, "b": viewB})
+			http.Error(w, "该暂停点的分叉记录不完整，请在“分叉恢复”区域预览并确认恢复，或取消后重新分叉", http.StatusConflict)
 			return
 		}
+		forkKey := lab.nextForkKeyLocked(baseKey)
 		now := time.Now().UTC().Format(time.RFC3339)
-		makeBranch := func(name string) *experiment {
-			stamp := strconv.FormatInt(time.Now().UnixNano(), 36)
-			id := "exp-" + stamp + "-" + name
-			for suffix := 1; lab.experiments[id] != nil; suffix++ {
-				id = fmt.Sprintf("exp-%s-%s-%d", stamp, name, suffix)
-			}
+		manifest := &raft.ForkManifest{
+			ForkKey:     forkKey,
+			BranchAID:   raft.BranchID(forkKey, "a"),
+			BranchBID:   raft.BranchID(forkKey, "b"),
+			SourcePause: body.Selector,
+			SourceAt:    lab.sim.Now(),
+			Base:        base,
+			SourceHash:  raft.ScenarioHash(base),
+			Phase:       raft.ForkPhasePartial,
+			CreatedAt:   now,
+			UpdatedAt:   now,
+		}
+		// The manifest is the operation's identity: persist it before any
+		// branch record so a crash mid-fork leaves a recoverable trace.
+		if err := lab.saveManifestLocked(manifest); err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "分叉清单保存失败，未创建任何分支："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		makeBranch := func(name, id string) *experiment {
 			sourcePause := body.Selector
 			doc := raft.ExperimentDoc{
 				ID:          id,
@@ -496,6 +716,7 @@ func (lab *Lab) routes() *http.ServeMux {
 				SourcePause: &sourcePause,
 				SourceAt:    lab.sim.Now(),
 				ForkKey:     forkKey,
+				SourceHash:  manifest.SourceHash,
 			}
 			// Clone the live simulator at the pause point: both branches share
 			// the exact same prefix and then diverge independently.
@@ -504,8 +725,8 @@ func (lab *Lab) routes() *http.ServeMux {
 			lab.experiments[doc.ID] = exp
 			return exp
 		}
-		branchA := makeBranch("a")
-		branchB := makeBranch("b")
+		branchA := makeBranch("a", manifest.BranchAID)
+		branchB := makeBranch("b", manifest.BranchBID)
 		if err := lab.saveExperimentLocked(branchA); err != nil {
 			delete(lab.experiments, branchA.doc.ID)
 			delete(lab.experiments, branchB.doc.ID)
@@ -521,6 +742,12 @@ func (lab *Lab) routes() *http.ServeMux {
 			http.Error(w, "分叉 B 保存失败，已回滚 A，现有实验未改动："+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		manifest.Phase = raft.ForkPhaseComplete
+		manifest.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := lab.saveManifestLocked(manifest); err != nil {
+			log.Printf("fork %s: manifest phase update failed: %v", forkKey, err)
+		}
+		lab.manifests[forkKey] = manifest
 		viewA := branchA.view()
 		viewB := branchB.view()
 		lab.mu.Unlock()
@@ -535,6 +762,119 @@ func (lab *Lab) routes() *http.ServeMux {
 		lab.mu.Unlock()
 		sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
 		writeJSON(w, views)
+	}))
+	mux.HandleFunc("GET /api/forks", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		lab.mu.Lock()
+		lab.ensureManifestsLocked()
+		views := []forkView{}
+		for _, manifest := range lab.manifests {
+			lab.refreshPhaseLocked(manifest)
+			view := forkView{
+				ForkKey:     manifest.ForkKey,
+				Phase:       manifest.Phase,
+				SourcePause: manifest.SourcePause,
+				SourceAt:    manifest.SourceAt,
+				BranchAID:   manifest.BranchAID,
+				BranchBID:   manifest.BranchBID,
+				CreatedAt:   manifest.CreatedAt,
+				UpdatedAt:   manifest.UpdatedAt,
+			}
+			if manifest.Phase == raft.ForkPhasePartial {
+				view.Recovery = lab.classifyLocked(manifest)
+			}
+			views = append(views, view)
+		}
+		lab.mu.Unlock()
+		sort.Slice(views, func(i, j int) bool { return views[i].CreatedAt < views[j].CreatedAt })
+		writeJSON(w, views)
+	}))
+	// Recovery confirmation: rebuild only the damaged side from the fork
+	// manifest's frozen base with an empty decision list. The healthy
+	// side's record and history are never touched, and the damaged side
+	// is never credited with decisions it lost.
+	mux.HandleFunc("POST /api/forks/{key}/recover", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		lab.mu.Lock()
+		defer lab.mu.Unlock()
+		lab.ensureManifestsLocked()
+		manifest, ok := lab.manifests[key]
+		if !ok {
+			http.Error(w, "fork manifest not found", http.StatusNotFound)
+			return
+		}
+		if manifest.Phase == raft.ForkPhaseCanceled {
+			http.Error(w, "该分叉已取消，清单与损坏记录均保留为证据；如需继续请重新分叉", http.StatusConflict)
+			return
+		}
+		lab.refreshPhaseLocked(manifest)
+		if manifest.Phase == raft.ForkPhaseComplete {
+			// Repeated confirm (double click, retry after restart): the pair
+			// is already intact, return it without rewriting anything.
+			expA, expB := lab.experiments[manifest.BranchAID], lab.experiments[manifest.BranchBID]
+			if expA != nil && expB != nil {
+				writeJSON(w, map[string]experimentView{"a": expA.view(), "b": expB.view()})
+				return
+			}
+		}
+		recovery := lab.classifyLocked(manifest)
+		if !recovery.Recoverable {
+			http.Error(w, recovery.Reason, http.StatusConflict)
+			return
+		}
+		planned := *recovery.Planned
+		planned.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		sim, err := raft.LoadExperiment(planned)
+		if err != nil {
+			http.Error(w, "共同起点无法重建，未改动任何记录："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Quarantine the damaged record as evidence before writing the
+		// replacement; never delete it silently.
+		damagedPath := filepath.Join(experimentDir, recovery.DamagedID+".json")
+		if raw, readErr := os.ReadFile(damagedPath); readErr == nil {
+			stamp := strconv.FormatInt(time.Now().UnixNano(), 36)
+			evidence := filepath.Join(experimentDir, recovery.DamagedID+".corrupt-"+stamp+".json")
+			if writeErr := os.WriteFile(evidence, raw, 0o644); writeErr != nil {
+				http.Error(w, "损坏记录取证失败，未改动任何记录："+writeErr.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		rebuilt := &experiment{doc: planned, sim: sim}
+		if err := lab.saveExperimentLocked(rebuilt); err != nil {
+			http.Error(w, "恢复记录写入失败，现有记录未改动："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		delete(lab.experiments, recovery.DamagedID+".json")
+		lab.experiments[planned.ID] = rebuilt
+		manifest.Phase = raft.ForkPhaseComplete
+		manifest.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+		if err := lab.saveManifestLocked(manifest); err != nil {
+			log.Printf("fork %s: manifest update after recovery failed: %v", key, err)
+		}
+		expA, expB := lab.experiments[manifest.BranchAID], lab.experiments[manifest.BranchBID]
+		writeJSON(w, map[string]experimentView{"a": expA.view(), "b": expB.view()})
+	}))
+	// Cancel keeps every piece of evidence (manifest tombstone, damaged
+	// record, healthy side) and only stops offering recovery.
+	mux.HandleFunc("POST /api/forks/{key}/cancel", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		lab.mu.Lock()
+		defer lab.mu.Unlock()
+		lab.ensureManifestsLocked()
+		manifest, ok := lab.manifests[key]
+		if !ok {
+			http.Error(w, "fork manifest not found", http.StatusNotFound)
+			return
+		}
+		if manifest.Phase != raft.ForkPhaseCanceled {
+			manifest.Phase = raft.ForkPhaseCanceled
+			manifest.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			if err := lab.saveManifestLocked(manifest); err != nil {
+				http.Error(w, "取消状态保存失败："+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		writeJSON(w, manifest)
 	}))
 	mux.HandleFunc("GET /api/experiments/", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Path[len("/api/experiments/"):]
@@ -876,6 +1216,7 @@ func main() {
 	_ = sim.ElectInitial(live.InitialLeader)
 	lab := &Lab{sim: sim, scenario: live}
 	lab.loadExperiments()
+	lab.loadManifests()
 	lab.loadAnalyses()
 	log.Fatal(http.ListenAndServe(":8080", lab.routes()))
 }

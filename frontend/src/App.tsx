@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { BranchPanel, messageSelector } from './BranchPanel';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { DivergenceAnalysis, Event, ExperimentView, InterventionRef, NodeView, Scenario, Selector, State } from './types';
+import type { DivergenceAnalysis, Event, ExperimentView, ForkView, InterventionRef, NodeView, Scenario, Selector, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -64,6 +64,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
   const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
+  const [forks, setForks] = useState<ForkView[]>([]);
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -83,6 +84,27 @@ export default function App() {
       }
       setBranches(next);
       setAnalyses(await api.analyses());
+      setForks(await api.forks());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const confirmRecover = async (forkKey: string) => {
+    try {
+      await api.recoverFork(forkKey);
+      await loadExperiments();
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const cancelRecover = async (forkKey: string) => {
+    try {
+      await api.cancelFork(forkKey);
+      await loadExperiments();
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -222,6 +244,9 @@ export default function App() {
     'different-acknowledgements': '节点已作不同确认',
     incomplete: '资料尚未完整',
   };
+  const pendingForks = forks.filter((fork) => fork.phase !== 'complete');
+  const formatPause = (selector: Selector) =>
+    [selector.type, `${selector.from ?? '?'}→${selector.to ?? '?'}`, `term ${selector.term ?? '?'}`].join(' ');
 
   return (
     <main>
@@ -289,6 +314,48 @@ export default function App() {
         </div>
       </section>
 
+      {pendingForks.length > 0 && (
+        <section className="fork-recovery">
+          <h2>分叉恢复（仅重建损坏侧，健康侧历史保持不变）</h2>
+          {pendingForks.map((fork) => (
+            <article className="recovery-card" key={fork.forkKey}>
+              <header>
+                <strong>分叉 {fork.forkKey.slice(0, 12)}…</strong>
+                <span>{fork.phase === 'canceled' ? '已取消（证据保留）' : '记录不完整'}</span>
+              </header>
+              <p>共同起点：t {fork.sourceAt} · 暂停于 {formatPause(fork.sourcePause)}</p>
+              {fork.recovery && (
+                <div className="recovery-preview">
+                  <p>
+                    健康侧 {fork.recovery.healthySide}（{fork.recovery.healthyId}）已执行
+                    {fork.recovery.healthyDecisions.length} 条决定：
+                    {fork.recovery.healthyDecisions.map((d) => d.label).join('、') || '（无）'}
+                  </p>
+                  <p>损坏侧 {fork.recovery.damagedSide}（{fork.recovery.damagedId}）：{fork.recovery.damagedError}</p>
+                  {fork.recovery.planned && (
+                    <p>
+                      将新建记录 {fork.recovery.planned.id}（{fork.recovery.planned.name}）：
+                      从共同起点重建，决定列表为空（[]），不会补写损坏侧丢失的决定。
+                    </p>
+                  )}
+                  {!fork.recovery.recoverable && <p className="error">{fork.recovery.reason}</p>}
+                </div>
+              )}
+              {fork.phase !== 'canceled' && (
+                <div className="recovery-actions">
+                  <button
+                    disabled={!fork.recovery?.recoverable}
+                    onClick={() => confirmRecover(fork.forkKey)}
+                  >
+                    确认恢复
+                  </button>
+                  <button onClick={() => cancelRecover(fork.forkKey)}>取消恢复（保留证据）</button>
+                </div>
+              )}
+            </article>
+          ))}
+        </section>
+      )}
       {branchList.length > 0 && (
         <section className="experiments">
           <h2>实验分支比较（共同前缀一致，队列与计时互相独立；决策已持久化，重开后自动恢复）</h2>

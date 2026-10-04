@@ -63,10 +63,7 @@ func ScenarioHash(base Scenario) string {
 // BranchID derives the branch record id from the operation key, so the
 // missing side of a damaged pair is always rebuilt under the same id.
 func BranchID(forkKey, name string) string {
-	short := forkKey
-	if len(short) > 16 {
-		short = short[:16]
-	}
+	sum := sha1.Sum([]byte(forkKey))
+	short := hex.EncodeToString(sum[:8])
 	return fmt.Sprintf("exp-fork-%s-%s", short, name)
 }
-

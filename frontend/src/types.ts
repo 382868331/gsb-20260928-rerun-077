@@ -136,3 +136,27 @@ export interface ExperimentView extends ExperimentDoc {
   state: State | null;
   loadError?: string;
 }
+
+export interface ForkRecovery {
+  healthySide: string;
+  healthyId: string;
+  healthyDecisions: Decision[];
+  damagedSide: string;
+  damagedId: string;
+  damagedError: string;
+  planned?: ExperimentDoc | null;
+  recoverable: boolean;
+  reason?: string;
+}
+
+export interface ForkView {
+  forkKey: string;
+  phase: 'partial' | 'recovering' | 'complete' | 'canceled';
+  sourcePause: Selector;
+  sourceAt: number;
+  branchAId: string;
+  branchBId: string;
+  createdAt: string;
+  updatedAt: string;
+  recovery?: ForkRecovery | null;
+}
