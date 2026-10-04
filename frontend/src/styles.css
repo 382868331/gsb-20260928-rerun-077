@@ -56,5 +56,14 @@ th { color: #93c5fd; position: sticky; top: 0; background: #1e293b; }
 .analysis-messages { display: grid; gap: 4px; margin-bottom: 10px; color: #94a3b8; font-size: 12px; }
 .analysis-links { display: flex; gap: 14px; flex-wrap: wrap; }
 .analysis-links a { color: #93c5fd; }
+.recovery { margin-top: 24px; display: grid; gap: 12px; }
+.recovery-card { background: #1e293b; border: 1px solid #b45309; border-radius: 12px; padding: 14px; }
+.recovery-card p { margin: 0 0 10px; color: #cbd5e1; }
+.recovery-note { color: #fbbf24; }
+.recovery-preview { margin-top: 16px; background: #0f172a; border: 2px solid #b45309; border-radius: 12px; padding: 16px; }
+.recovery-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.recovery-grid h3 { margin: 0 0 6px; font-size: 14px; color: #93c5fd; }
+.recovery-grid p, .recovery-grid li { color: #cbd5e1; font-size: 13px; }
+.recovery-actions { display: flex; gap: 10px; margin-top: 14px; }
 @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .branch-grid { grid-template-columns: 1fr; } }

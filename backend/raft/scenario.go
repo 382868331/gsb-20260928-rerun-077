@@ -55,6 +55,11 @@ type ExperimentDoc struct {
 	SourcePause *Selector `json:"sourcePause,omitempty"`
 	SourceAt    int64     `json:"sourceAt,omitempty"`
 	ForkKey     string    `json:"forkKey,omitempty"`
+	// RecoveredFrom records that this record was rebuilt by pair recovery
+	// after the other side's record was damaged. The recovered branch
+	// restarts from the common prefix with an empty decision list: it
+	// never inherits or fabricates the damaged side's history.
+	RecoveredFrom string `json:"recoveredFrom,omitempty"`
 }
 
 type Scenario struct {

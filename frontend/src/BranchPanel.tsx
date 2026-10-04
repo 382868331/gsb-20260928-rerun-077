@@ -60,6 +60,11 @@ export function BranchPanel({ title, experiment, pairId, onChange, onAnalyze, on
         </div>
       )}
       {experiment.loadError && <div className="error" role="alert">{experiment.loadError}</div>}
+      {experiment.recoveredFrom && (
+        <div className="source-pause">
+          该记录由配对恢复重建（替代损坏记录 {experiment.recoveredFrom}）：从共同起点重新开始，未继承损坏侧历史。
+        </div>
+      )}
       <div className="branch-controls">
         <label>推进 <input type="number" value={ticks} onChange={(e) => setTicks(Number(e.target.value))} /></label>
         <button disabled={experiment.readOnly} onClick={() => run(api.branch(experiment.id, 'advance', { ticks }))}>推进</button>

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { BranchPanel, messageSelector } from './BranchPanel';
 import { ErrorBoundary } from './ErrorBoundary';
-import type { DivergenceAnalysis, Event, ExperimentView, InterventionRef, NodeView, Scenario, Selector, State } from './types';
+import type { DivergenceAnalysis, Event, ExperimentView, InterventionRef, NodeView, RecoveryPreview, Scenario, Selector, State } from './types';
 
 function roleClass(role: string) {
   return `role ${role}`;
@@ -64,6 +64,8 @@ export default function App() {
   const [error, setError] = useState('');
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
   const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
+  const [recovery, setRecovery] = useState<RecoveryPreview | null>(null);
+  const [recoveryNote, setRecoveryNote] = useState('');
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -210,6 +212,39 @@ export default function App() {
     return '';
   };
 
+  const openRecovery = async (experiment: ExperimentView) => {
+    try {
+      setRecovery(await api.recoveryPreview(experiment.id));
+      setRecoveryNote('');
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const confirmRecovery = async () => {
+    if (!recovery) return;
+    try {
+      const result = await api.recoverPair(recovery.healthy.id);
+      setRecovery(null);
+      setRecoveryNote(
+        result.existing
+          ? `配对 ${result.experiment.id} 此前已恢复（或重复点击），未产生重复记录。`
+          : `已从共同起点重建 ${result.experiment.id}：新记录决定列表为空，不继承损坏侧历史；损坏记录仍保留在列表中作为证据。`,
+      );
+      await loadExperiments();
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const cancelRecovery = () => {
+    // 取消不删除任何证据：损坏记录仍保留在实验列表与磁盘上。
+    setRecovery(null);
+    setRecoveryNote('已取消恢复：未写入任何新记录，损坏记录仍保留在下方列表中作为证据。');
+  };
+
   const safeState = (value: State | null): State => value ?? { now: 0, nodes: [], inFlight: [], events: [], committed: {}, paused: false };
   const branchList = Object.values(branches)
     .filter((experiment) => experiment.name === 'a' || experiment.name === 'b' || Boolean(experiment.loadError))
@@ -217,6 +252,14 @@ export default function App() {
   const controlList = Object.values(branches)
     .filter((experiment) => experiment.readOnly)
     .sort((a, b) => a.id.localeCompare(b.id));
+  const healthyForkSides = Object.values(branches).filter(
+    (experiment) => (experiment.name === 'a' || experiment.name === 'b') && !experiment.loadError && experiment.forkKey,
+  );
+  const damagedPairs = healthyForkSides.filter(
+    (experiment) => !healthyForkSides.some(
+      (other) => other.id !== experiment.id && other.forkKey === experiment.forkKey && other.name !== experiment.name,
+    ),
+  );
   const classificationText: Record<DivergenceAnalysis['classification'], string> = {
     'arrival-order-only': '仅消息到达顺序不同',
     'different-acknowledgements': '节点已作不同确认',
@@ -324,6 +367,59 @@ export default function App() {
               ))}
             </div>
           )}
+        </section>
+      )}
+      {(damagedPairs.length > 0 || recoveryNote) && (
+        <section className="recovery">
+          <h2>配对恢复（另一侧记录损坏或缺失）</h2>
+          {recoveryNote && <p className="recovery-note">{recoveryNote}</p>}
+          {damagedPairs.map((experiment) => (
+            <article className="recovery-card" key={experiment.id}>
+              <p>
+                实验 {experiment.name === 'a' ? 'A' : 'B'}（{experiment.id}）的另一侧
+                {experiment.name === 'a' ? ' B ' : ' A '}记录损坏或缺失，可从共同起点重建一个新记录。
+                健康侧已执行的 {experiment.decisions?.length ?? 0} 条决定不会被改动。
+              </p>
+              <button onClick={() => openRecovery(experiment)}>查看恢复方案</button>
+            </article>
+          ))}
+        </section>
+      )}
+      {recovery && (
+        <section className="recovery-preview" role="dialog" aria-label="恢复预览">
+          <h2>恢复预览（确认前不会写入任何记录）</h2>
+          <div className="recovery-grid">
+            <div>
+              <h3>健康侧已执行决定（{recovery.healthy.decisions?.length ?? 0} 条，保持不变）</h3>
+              <ol>
+                {(recovery.healthy.decisions ?? []).map((decision) => (
+                  <li key={decision.id}>t {decision.at} · {decision.label}</li>
+                ))}
+              </ol>
+            </div>
+            <div>
+              <h3>损坏侧：实验 {recovery.damagedName === 'a' ? 'A' : 'B'}</h3>
+              <p>{recovery.damagedState === 'missing' ? '记录文件缺失。' : '记录已损坏，无法重建。'}</p>
+              {recovery.damagedRecords.map((record) => (
+                <p key={record.id} className="error">{record.id}：{record.loadError}</p>
+              ))}
+              <p>损坏记录会原样保留在列表与磁盘上作为证据，不会被覆盖或删除。</p>
+            </div>
+            <div>
+              <h3>共同起点</h3>
+              <p>场景 {recovery.baseName} · 冻结于 t {recovery.sourceAt ?? 0}
+                {recovery.sourcePause && ` · 暂停消息 ${recovery.sourcePause.type} ${recovery.sourcePause.from}→${recovery.sourcePause.to}`}</p>
+            </div>
+            <div>
+              <h3>将新建的记录</h3>
+              <p>ID <code>{recovery.newRecord.id}</code>（实验 {recovery.newRecord.name === 'a' ? 'A' : 'B'}）</p>
+              <p>从共同起点重放到暂停点，决定列表为空：不假装损坏侧曾经继续执行，后续决定从确认恢复后开始记录。</p>
+            </div>
+          </div>
+          <div className="recovery-actions">
+            <button className="fork-button" onClick={confirmRecovery}>确认恢复</button>
+            <button onClick={cancelRecovery}>取消（保留证据）</button>
+          </div>
         </section>
       )}
       {analyses.length > 0 && (

@@ -138,6 +138,110 @@ func (lab *Lab) findForkPairLocked(key string) (*experiment, *experiment) {
 	return nil, nil
 }
 
+// recoveryPreview describes a damaged A/B pair before any repair is
+// confirmed: the healthy side's executed decisions, the damaged side, the
+// common starting point and the exact new record a recovery would create.
+type recoveryPreview struct {
+	ForkKey        string             `json:"forkKey"`
+	Healthy        experimentView     `json:"healthy"`
+	DamagedName    string             `json:"damagedName"`
+	DamagedState   string             `json:"damagedState"` // "missing" or "damaged"
+	DamagedRecords []experimentView   `json:"damagedRecords"`
+	SourcePause    *raft.Selector     `json:"sourcePause"`
+	SourceAt       int64              `json:"sourceAt"`
+	BaseName       string             `json:"baseName"`
+	NewRecord      raft.ExperimentDoc `json:"newRecord"`
+}
+
+// otherSideName returns the counterpart branch name of an a/b pair.
+func otherSideName(name string) string {
+	if name == "a" {
+		return "b"
+	}
+	return "a"
+}
+
+// healthySiblingLocked returns the healthy counterpart of exp in the same
+// fork operation, or nil when that side is missing or unreadable.
+func (lab *Lab) healthySiblingLocked(exp *experiment) *experiment {
+	want := otherSideName(exp.doc.Name)
+	for _, candidate := range lab.experiments {
+		if candidate.doc.ForkKey == exp.doc.ForkKey && candidate.doc.Name == want && candidate.loadErr == "" && candidate.sim != nil {
+			return candidate
+		}
+	}
+	return nil
+}
+
+// damagedRecordsLocked collects the unreadable/unloadable records that may
+// be the damaged side of this pair. They are kept listed as evidence and
+// are never deleted or overwritten by recovery.
+func (lab *Lab) damagedRecordsLocked(key string) []experimentView {
+	out := []experimentView{}
+	for _, candidate := range lab.experiments {
+		if candidate.loadErr == "" {
+			continue
+		}
+		if candidate.doc.ForkKey == key || candidate.doc.Name == "unreadable" {
+			out = append(out, candidate.view())
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// buildRecoveryLocked computes the recovery plan for the pair that exp
+// belongs to. It fails when the pair is already healthy or when exp itself
+// cannot serve as the healthy reference side.
+func (lab *Lab) buildRecoveryLocked(id string) (recoveryPreview, *experiment, error) {
+	exp, ok := lab.experiments[id]
+	if !ok {
+		return recoveryPreview{}, nil, fmt.Errorf("experiment not found")
+	}
+	if exp.loadErr != "" || exp.sim == nil {
+		return recoveryPreview{}, nil, fmt.Errorf("该记录本身已损坏，不能作为恢复参照；请以健康一侧发起恢复")
+	}
+	if exp.doc.ForkKey == "" || (exp.doc.Name != "a" && exp.doc.Name != "b") {
+		return recoveryPreview{}, nil, fmt.Errorf("该实验不属于可恢复的 A/B 分叉配对")
+	}
+	if sibling := lab.healthySiblingLocked(exp); sibling != nil {
+		return recoveryPreview{}, sibling, nil
+	}
+	damagedName := otherSideName(exp.doc.Name)
+	damaged := lab.damagedRecordsLocked(exp.doc.ForkKey)
+	damagedState := "missing"
+	if len(damaged) > 0 {
+		damagedState = "damaged"
+	}
+	recoveredFrom := "missing-record"
+	if len(damaged) > 0 {
+		recoveredFrom = damaged[0].ID
+	}
+	newDoc := raft.ExperimentDoc{
+		ID:            raft.BranchID(exp.doc.ForkKey, damagedName),
+		Name:          damagedName,
+		Base:          exp.doc.Base,
+		Decisions:     []raft.Decision{},
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+		SourcePause:   exp.doc.SourcePause,
+		SourceAt:      exp.doc.SourceAt,
+		ForkKey:       exp.doc.ForkKey,
+		RecoveredFrom: recoveredFrom,
+	}
+	preview := recoveryPreview{
+		ForkKey:        exp.doc.ForkKey,
+		Healthy:        exp.view(),
+		DamagedName:    damagedName,
+		DamagedState:   damagedState,
+		DamagedRecords: damaged,
+		SourcePause:    exp.doc.SourcePause,
+		SourceAt:       exp.doc.SourceAt,
+		BaseName:       exp.doc.Base.Name,
+		NewRecord:      newDoc,
+	}
+	return preview, nil, nil
+}
+
 func (lab *Lab) loadExperiments() {
 	lab.experiments = map[string]*experiment{}
 	entries, err := os.ReadDir(experimentDir)
@@ -550,6 +654,70 @@ func (lab *Lab) routes() *http.ServeMux {
 			return
 		}
 		writeJSON(w, view)
+	}))
+	// Recovery preview: shows what a repair of the damaged pair would do
+	// without changing anything. Canceling here keeps every record — the
+	// damaged file stays on disk and stays listed as evidence.
+	mux.HandleFunc("GET /api/experiments/{id}/recovery-preview", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		lab.mu.Lock()
+		preview, sibling, err := lab.buildRecoveryLocked(id)
+		lab.mu.Unlock()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if sibling != nil {
+			http.Error(w, "配对的另一侧记录健康完整，无需恢复", http.StatusConflict)
+			return
+		}
+		writeJSON(w, preview)
+	}))
+	// Recovery confirm: creates exactly one replacement record for the
+	// damaged side, rebuilt from the common starting point with an empty
+	// decision list. The healthy side's file and history are never
+	// touched, the damaged record is kept as evidence, and repeating the
+	// request returns the already-recovered record instead of duplicating.
+	mux.HandleFunc("POST /api/experiments/{id}/recover", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		lab.mu.Lock()
+		preview, sibling, err := lab.buildRecoveryLocked(id)
+		if err != nil {
+			lab.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if sibling != nil {
+			// Already healthy (repeated click, or recovered earlier and
+			// the process restarted): return the existing record.
+			view := sibling.view()
+			lab.mu.Unlock()
+			writeJSON(w, map[string]any{"recovered": false, "existing": true, "experiment": view})
+			return
+		}
+		newDoc := preview.NewRecord
+		if existing, ok := lab.experiments[newDoc.ID]; ok && existing.loadErr == "" && existing.sim != nil {
+			view := existing.view()
+			lab.mu.Unlock()
+			writeJSON(w, map[string]any{"recovered": false, "existing": true, "experiment": view})
+			return
+		}
+		sim, loadErr := raft.LoadExperiment(newDoc)
+		if loadErr != nil {
+			lab.mu.Unlock()
+			http.Error(w, "共同起点无法重建，未写入任何恢复记录："+loadErr.Error(), http.StatusInternalServerError)
+			return
+		}
+		recovered := &experiment{doc: newDoc, sim: sim}
+		if err := lab.saveExperimentLocked(recovered); err != nil {
+			lab.mu.Unlock()
+			http.Error(w, "恢复记录保存失败，现有实验未改动："+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		lab.experiments[newDoc.ID] = recovered
+		view := recovered.view()
+		lab.mu.Unlock()
+		writeJSON(w, map[string]any{"recovered": true, "existing": false, "experiment": view})
 	}))
 	mux.HandleFunc("GET /api/analyses", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		lab.mu.Lock()

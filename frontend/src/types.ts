@@ -99,6 +99,25 @@ export interface ExperimentDoc {
   sourcePause?: Selector | null;
   sourceAt?: number;
   forkKey?: string;
+  recoveredFrom?: string;
+}
+
+export interface RecoveryPreview {
+  forkKey: string;
+  healthy: ExperimentView;
+  damagedName: string;
+  damagedState: 'missing' | 'damaged';
+  damagedRecords: ExperimentView[];
+  sourcePause?: Selector | null;
+  sourceAt?: number;
+  baseName: string;
+  newRecord: ExperimentDoc;
+}
+
+export interface RecoveryResult {
+  recovered: boolean;
+  existing: boolean;
+  experiment: ExperimentView;
 }
 
 export interface InterventionRef {
