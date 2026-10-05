@@ -19,9 +19,10 @@ const (
 	// ForkPhaseComplete: both sides are present, readable, replayable and
 	// bind to the same frozen source snapshot.
 	ForkPhaseComplete = "complete"
-	// ForkPhaseCanceled: the unfinished fork was explicitly canceled. The
-	// manifest remains only as an idempotency tombstone; retrying the
-	// original request after cancellation starts a new operation identity.
+	// ForkPhaseCanceled was used by older builds as a persistent tombstone.
+	// Cancellation now ends only the current recovery session: the manifest
+	// keeps reflecting the records actually present, so the constant only
+	// remains to recognize (and heal) manifests written by older builds.
 	ForkPhaseCanceled = "canceled"
 )
 

@@ -65,6 +65,10 @@ export default function App() {
   const [branches, setBranches] = useState<Record<string, ExperimentView>>({});
   const [analyses, setAnalyses] = useState<DivergenceAnalysis[]>([]);
   const [forks, setForks] = useState<ForkView[]>([]);
+  // Dismissal is per UI session only: canceling a recovery ends this
+  // attempt but keeps the damaged record and healthy history, and the
+  // same preview can be reopened (or comes back after a page refresh).
+  const [dismissedRecoveries, setDismissedRecoveries] = useState<Record<string, boolean>>({});
 
   const refresh = async (promise: Promise<State>) => {
     try {
@@ -103,11 +107,20 @@ export default function App() {
   const cancelRecover = async (forkKey: string) => {
     try {
       await api.cancelFork(forkKey);
-      await loadExperiments();
+      setDismissedRecoveries((prev) => ({ ...prev, [forkKey]: true }));
       setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  };
+
+  const reopenRecovery = async (forkKey: string) => {
+    setDismissedRecoveries((prev) => {
+      const next = { ...prev };
+      delete next[forkKey];
+      return next;
+    });
+    await loadExperiments();
   };
 
   useEffect(() => {
@@ -321,10 +334,14 @@ export default function App() {
             <article className="recovery-card" key={fork.forkKey}>
               <header>
                 <strong>分叉 {fork.forkKey.slice(0, 12)}…</strong>
-                <span>{fork.phase === 'canceled' ? '已取消（证据保留）' : '记录不完整'}</span>
+                <span>
+                  {dismissedRecoveries[fork.forkKey] || fork.phase === 'canceled'
+                    ? '本次恢复已取消（原损坏记录与健康侧历史均保留）'
+                    : '记录不完整'}
+                </span>
               </header>
               <p>共同起点：t {fork.sourceAt} · 暂停于 {formatPause(fork.sourcePause)}</p>
-              {fork.recovery && (
+              {fork.recovery && !dismissedRecoveries[fork.forkKey] && (
                 <div className="recovery-preview">
                   <p>
                     健康侧 {fork.recovery.healthySide}（{fork.recovery.healthyId}）已执行
@@ -341,7 +358,11 @@ export default function App() {
                   {!fork.recovery.recoverable && <p className="error">{fork.recovery.reason}</p>}
                 </div>
               )}
-              {fork.phase !== 'canceled' && (
+              {dismissedRecoveries[fork.forkKey] || fork.phase === 'canceled' ? (
+                <div className="recovery-actions">
+                  <button onClick={() => reopenRecovery(fork.forkKey)}>重新发起恢复预览</button>
+                </div>
+              ) : (
                 <div className="recovery-actions">
                   <button
                     disabled={!fork.recovery?.recoverable}
@@ -349,7 +370,7 @@ export default function App() {
                   >
                     确认恢复
                   </button>
-                  <button onClick={() => cancelRecover(fork.forkKey)}>取消恢复（保留证据）</button>
+                  <button onClick={() => cancelRecover(fork.forkKey)}>取消恢复（仅结束本次操作，保留证据）</button>
                 </div>
               )}
             </article>

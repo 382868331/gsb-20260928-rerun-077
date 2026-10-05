@@ -194,11 +194,16 @@ func TestRecoverMissingSideFile(t *testing.T) {
 	}
 }
 
-func TestCancelRecoveryKeepsEvidence(t *testing.T) {
+func TestCancelEndsOnlyThisAttemptAndKeepsPreview(t *testing.T) {
 	lab := newTestLab(t)
 	pair, _ := forkAndAdvanceA(t, lab)
+	idA := pair["a"].ID
 	idB := pair["b"].ID
 	damagedPath := filepath.Join(experimentDir, idB+".json")
+	healthyBefore, err := os.ReadFile(filepath.Join(experimentDir, idA+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(damagedPath, []byte("{broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -210,35 +215,104 @@ func TestCancelRecoveryKeepsEvidence(t *testing.T) {
 	if cancel.Code != 200 {
 		t.Fatalf("cancel: %s", cancel.Body.String())
 	}
-	// Evidence retained: manifest tombstone and the damaged record itself.
+	// Cancel ends only the current attempt: every piece of evidence stays.
 	if _, err := os.Stat(damagedPath); err != nil {
 		t.Fatal("cancel removed the damaged record")
 	}
-	if _, err := os.Stat(filepath.Join(forkDir, view.ForkKey+".json")); err != nil {
-		t.Fatal("cancel removed the manifest tombstone")
+	healthyAfter, _ := os.ReadFile(filepath.Join(experimentDir, idA+".json"))
+	if !bytes.Equal(healthyBefore, healthyAfter) {
+		t.Fatal("cancel disturbed the healthy side's record")
 	}
+	// The manifest is not turned into a tombstone: the preview remains
+	// available so the user can start another recovery attempt.
 	after := onlyRecovery(t, mux)
-	if after.Phase != raft.ForkPhaseCanceled || after.Recovery != nil {
-		t.Fatalf("canceled fork still offered for recovery: %+v", after)
+	if after.Phase != raft.ForkPhasePartial || after.Recovery == nil || !after.Recovery.Recoverable {
+		t.Fatalf("cancel must keep the unfinished fork recoverable: %+v", after)
 	}
-	if r := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/recover", nil); r.Code != http.StatusConflict {
-		t.Fatalf("recover after cancel got %d, want 409", r.Code)
+	if after.Recovery.HealthyID != idA || len(after.Recovery.HealthyDecisions) != 2 {
+		t.Fatalf("cancel lost the healthy side or its history: %+v", after.Recovery)
+	}
+	if after.Recovery.DamagedID != idB || after.Recovery.Planned == nil || after.Recovery.Planned.ID != idB {
+		t.Fatalf("cancel lost the damaged-side rebuild plan: %+v", after.Recovery)
 	}
 
-	// Retrying the original fork request starts a new operation identity
-	// instead of resurrecting the canceled pair.
+	// Retrying the same fork request still maps to this operation: it must
+	// not mint a second, look-alike pair while the damaged record exists.
 	sel := pair["a"].SourcePause
-	refork := postJSON(t, mux, "/api/fork", map[string]any{"selector": sel})
-	if refork.Code != 200 {
-		t.Fatalf("re-fork after cancel: %s", refork.Body.String())
+	if refork := postJSON(t, mux, "/api/fork", map[string]any{"selector": sel}); refork.Code != http.StatusConflict {
+		t.Fatalf("re-fork after cancel got %d, want 409: %s", refork.Code, refork.Body.String())
 	}
-	var newPair map[string]experimentView
-	json.Unmarshal(refork.Body.Bytes(), &newPair)
-	if newPair["a"].ID == pair["a"].ID || newPair["b"].ID == idB {
-		t.Fatal("re-fork after cancel reused the canceled operation identity")
+	if len(restarted.experiments) != 2 {
+		t.Fatalf("re-fork after cancel created extra records: %d experiments", len(restarted.experiments))
 	}
-	if restarted.experiments[pair["a"].ID] == nil {
-		t.Fatal("re-fork disturbed the previous healthy side")
+
+	// Confirming again after cancellation rebuilds only the missing side
+	// from the shared starting point.
+	confirm := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/recover", nil)
+	if confirm.Code != 200 {
+		t.Fatalf("recover after reopen: %s", confirm.Body.String())
+	}
+	var recovered map[string]experimentView
+	if err := json.Unmarshal(confirm.Body.Bytes(), &recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered["b"].ID != idB || len(recovered["b"].Decisions) != 0 {
+		t.Fatalf("rebuilt side must reuse the original id with empty decisions: %+v", recovered["b"])
+	}
+	if len(recovered["a"].Decisions) != 2 {
+		t.Fatalf("healthy side history changed: %+v", recovered["a"])
+	}
+	healthyFinal, _ := os.ReadFile(filepath.Join(experimentDir, idA+".json"))
+	if !bytes.Equal(healthyBefore, healthyFinal) {
+		t.Fatal("reconfirm overwrote the healthy side's executed decisions")
+	}
+	matches, _ := filepath.Glob(filepath.Join(experimentDir, idB+".corrupt-*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("damaged record not preserved as the single evidence copy: %v", matches)
+	}
+
+	// A further restart shows a complete pair with no recovery entry.
+	finalView := onlyRecovery(t, restartLab(lab).routes())
+	if finalView.Phase != raft.ForkPhaseComplete || finalView.Recovery != nil {
+		t.Fatalf("reconfirmed pair not complete after refresh: %+v", finalView)
+	}
+}
+
+func TestLegacyCanceledTombstoneHealsBackToPreview(t *testing.T) {
+	lab := newTestLab(t)
+	pair, _ := forkAndAdvanceA(t, lab)
+	idB := pair["b"].ID
+	if err := os.WriteFile(filepath.Join(experimentDir, idB+".json"), []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate an older build that persisted cancellation as a tombstone.
+	manifestPath := filepath.Join(forkDir, pair["a"].ForkKey+".json")
+	raw, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest raft.ForkManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Phase = raft.ForkPhaseCanceled
+	if err := atomicWriteJSON(forkDir, manifest.ForkKey, manifest); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := restartLab(lab)
+	mux := restarted.routes()
+	view := onlyRecovery(t, mux)
+	if view.Phase != raft.ForkPhasePartial || view.Recovery == nil || !view.Recovery.Recoverable {
+		t.Fatalf("legacy canceled tombstone must reopen as recovery preview: %+v", view)
+	}
+	confirm := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/recover", nil)
+	if confirm.Code != 200 {
+		t.Fatalf("recover from legacy tombstone: %s", confirm.Body.String())
+	}
+	finalView := onlyRecovery(t, restartLab(lab).routes())
+	if finalView.Phase != raft.ForkPhaseComplete {
+		t.Fatalf("legacy tombstone recovery did not complete: %+v", finalView)
 	}
 }
 
