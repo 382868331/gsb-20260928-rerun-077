@@ -19,9 +19,8 @@ const (
 	// ForkPhaseComplete: both sides are present, readable, replayable and
 	// bind to the same frozen source snapshot.
 	ForkPhaseComplete = "complete"
-	// ForkPhaseCanceled: the unfinished fork was explicitly canceled. The
-	// manifest remains only as an idempotency tombstone; retrying the
-	// original request after cancellation starts a new operation identity.
+	// ForkPhaseCanceled: the current recovery interaction was dismissed.
+	// The damaged pair and evidence remain available for another preview.
 	ForkPhaseCanceled = "canceled"
 )
 

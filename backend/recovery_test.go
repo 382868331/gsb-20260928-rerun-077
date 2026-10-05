@@ -197,8 +197,13 @@ func TestRecoverMissingSideFile(t *testing.T) {
 func TestCancelRecoveryKeepsEvidence(t *testing.T) {
 	lab := newTestLab(t)
 	pair, _ := forkAndAdvanceA(t, lab)
+	idA := pair["a"].ID
 	idB := pair["b"].ID
 	damagedPath := filepath.Join(experimentDir, idB+".json")
+	healthyBefore, err := os.ReadFile(filepath.Join(experimentDir, idA+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(damagedPath, []byte("{broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -210,35 +215,111 @@ func TestCancelRecoveryKeepsEvidence(t *testing.T) {
 	if cancel.Code != 200 {
 		t.Fatalf("cancel: %s", cancel.Body.String())
 	}
-	// Evidence retained: manifest tombstone and the damaged record itself.
+	// Evidence retained: manifest and the damaged record itself.
 	if _, err := os.Stat(damagedPath); err != nil {
 		t.Fatal("cancel removed the damaged record")
 	}
 	if _, err := os.Stat(filepath.Join(forkDir, view.ForkKey+".json")); err != nil {
-		t.Fatal("cancel removed the manifest tombstone")
+		t.Fatal("cancel removed the manifest")
 	}
 	after := onlyRecovery(t, mux)
-	if after.Phase != raft.ForkPhaseCanceled || after.Recovery != nil {
-		t.Fatalf("canceled fork still offered for recovery: %+v", after)
+	if after.Phase != raft.ForkPhaseCanceled || after.Recovery == nil || !after.Recovery.Recoverable {
+		t.Fatalf("canceled fork must retain a re-openable recovery preview: %+v", after)
 	}
 	if r := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/recover", nil); r.Code != http.StatusConflict {
-		t.Fatalf("recover after cancel got %d, want 409", r.Code)
+		t.Fatalf("confirm after cancel got %d, want 409", r.Code)
 	}
 
-	// Retrying the original fork request starts a new operation identity
-	// instead of resurrecting the canceled pair.
 	sel := pair["a"].SourcePause
 	refork := postJSON(t, mux, "/api/fork", map[string]any{"selector": sel})
-	if refork.Code != 200 {
-		t.Fatalf("re-fork after cancel: %s", refork.Body.String())
+	if refork.Code != http.StatusConflict {
+		t.Fatalf("retry fork after cancel must reuse existing operation, got %d: %s", refork.Code, refork.Body.String())
 	}
-	var newPair map[string]experimentView
-	json.Unmarshal(refork.Body.Bytes(), &newPair)
-	if newPair["a"].ID == pair["a"].ID || newPair["b"].ID == idB {
-		t.Fatal("re-fork after cancel reused the canceled operation identity")
+	if len(restarted.experiments) != 2 {
+		t.Fatalf("fork retry after cancel created records: %d experiments", len(restarted.experiments))
 	}
 	if restarted.experiments[pair["a"].ID] == nil {
 		t.Fatal("re-fork disturbed the previous healthy side")
+	}
+
+	// The canceled interaction survives refresh and can be previewed again.
+	refreshedLab := restartLab(lab)
+	refreshedMux := refreshedLab.routes()
+	refreshed := onlyRecovery(t, refreshedMux)
+	if refreshed.Phase != raft.ForkPhaseCanceled || refreshed.Recovery == nil || refreshed.Recovery.Planned.ID != idB {
+		t.Fatalf("restart did not preserve cancellable recovery state: %+v", refreshed)
+	}
+	preview := postJSON(t, refreshedMux, "/api/forks/"+view.ForkKey+"/preview", nil)
+	if preview.Code != http.StatusOK {
+		t.Fatalf("preview after cancel: %s", preview.Body.String())
+	}
+	var previewView forkView
+	if err := json.Unmarshal(preview.Body.Bytes(), &previewView); err != nil {
+		t.Fatal(err)
+	}
+	if previewView.Phase != raft.ForkPhasePartial || previewView.Recovery == nil || previewView.Recovery.Planned.ID != idB {
+		t.Fatalf("reopened preview did not use the original damaged identity: %+v", previewView)
+	}
+
+	confirm := postJSON(t, refreshedMux, "/api/forks/"+view.ForkKey+"/recover", nil)
+	if confirm.Code != http.StatusOK {
+		t.Fatalf("recover after reopened preview: %s", confirm.Body.String())
+	}
+	var recovered map[string]experimentView
+	if err := json.Unmarshal(confirm.Body.Bytes(), &recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered["a"].ID != idA || len(recovered["a"].Decisions) != 2 {
+		t.Fatalf("recovery changed healthy side: %+v", recovered["a"])
+	}
+	if recovered["b"].ID != idB || len(recovered["b"].Decisions) != 0 {
+		t.Fatalf("recovery did not rebuild only the missing damaged side: %+v", recovered["b"])
+	}
+	healthyAfter, _ := os.ReadFile(filepath.Join(experimentDir, idA+".json"))
+	if !bytes.Equal(healthyBefore, healthyAfter) {
+		t.Fatal("recovery overwrote the healthy side's record")
+	}
+	again := postJSON(t, refreshedMux, "/api/forks/"+view.ForkKey+"/recover", nil)
+	if again.Code != http.StatusOK {
+		t.Fatalf("repeat recovery: %s", again.Body.String())
+	}
+	matches, _ := filepath.Glob(filepath.Join(experimentDir, idB+".corrupt-*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("repeat confirmation produced extra evidence/records: %v", matches)
+	}
+}
+
+func TestCancelAndRePreviewRecreatesMissingFile(t *testing.T) {
+	lab := newTestLab(t)
+	pair, _ := forkAndAdvanceA(t, lab)
+	idB := pair["b"].ID
+	missingPath := filepath.Join(experimentDir, idB+".json")
+	if err := os.Remove(missingPath); err != nil {
+		t.Fatal(err)
+	}
+	restarted := restartLab(lab)
+	mux := restarted.routes()
+	view := onlyRecovery(t, mux)
+	if r := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/cancel", nil); r.Code != http.StatusOK {
+		t.Fatalf("cancel missing-side recovery: %s", r.Body.String())
+	}
+	if r := postJSON(t, mux, "/api/forks/"+view.ForkKey+"/recover", nil); r.Code != http.StatusConflict {
+		t.Fatalf("confirm without reopened preview got %d, want 409", r.Code)
+	}
+
+	refreshed := restartLab(lab)
+	refreshedMux := refreshed.routes()
+	if r := postJSON(t, refreshedMux, "/api/forks/"+view.ForkKey+"/preview", nil); r.Code != http.StatusOK {
+		t.Fatalf("reopen missing-side preview: %s", r.Body.String())
+	}
+	if r := postJSON(t, refreshedMux, "/api/forks/"+view.ForkKey+"/recover", nil); r.Code != http.StatusOK {
+		t.Fatalf("recover missing side after preview: %s", r.Body.String())
+	}
+	if _, err := os.Stat(missingPath); err != nil {
+		t.Fatal("missing side file was not recreated after canceled recovery")
+	}
+	if len(refreshed.experiments) != 2 {
+		t.Fatalf("recovery created extra valid records: %d experiments", len(refreshed.experiments))
 	}
 }
 

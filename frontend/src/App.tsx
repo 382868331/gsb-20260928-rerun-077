@@ -110,6 +110,16 @@ export default function App() {
     }
   };
 
+  const previewRecover = async (forkKey: string) => {
+    try {
+      await api.previewFork(forkKey);
+      await loadExperiments();
+      setError('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   useEffect(() => {
     Promise.all([api.state(), api.currentScenario()])
       .then(([nextState, nextScenario]) => {
@@ -321,7 +331,7 @@ export default function App() {
             <article className="recovery-card" key={fork.forkKey}>
               <header>
                 <strong>分叉 {fork.forkKey.slice(0, 12)}…</strong>
-                <span>{fork.phase === 'canceled' ? '已取消（证据保留）' : '记录不完整'}</span>
+                <span>{fork.phase === 'canceled' ? '已取消，可重新预览' : '记录不完整'}</span>
               </header>
               <p>共同起点：t {fork.sourceAt} · 暂停于 {formatPause(fork.sourcePause)}</p>
               {fork.recovery && (
@@ -341,7 +351,16 @@ export default function App() {
                   {!fork.recovery.recoverable && <p className="error">{fork.recovery.reason}</p>}
                 </div>
               )}
-              {fork.phase !== 'canceled' && (
+              {fork.phase === 'canceled' ? (
+                <div className="recovery-actions">
+                  <button
+                    disabled={!fork.recovery?.recoverable}
+                    onClick={() => previewRecover(fork.forkKey)}
+                  >
+                    重新发起恢复预览
+                  </button>
+                </div>
+              ) : (
                 <div className="recovery-actions">
                   <button
                     disabled={!fork.recovery?.recoverable}

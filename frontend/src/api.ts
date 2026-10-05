@@ -31,5 +31,6 @@ export const api = {
   branch: (id: string, op: string, body?: unknown) => call<ExperimentView>(`/api/experiments/${id}/${op}`, body ?? {}),
   forks: () => call<ForkView[]>('/api/forks'),
   recoverFork: (key: string) => call<{ a: ExperimentView; b: ExperimentView }>(`/api/forks/${encodeURIComponent(key)}/recover`, {}),
+  previewFork: (key: string) => call<ForkView>(`/api/forks/${encodeURIComponent(key)}/preview`, {}),
   cancelFork: (key: string) => call<ForkView>(`/api/forks/${encodeURIComponent(key)}/cancel`, {}),
 };

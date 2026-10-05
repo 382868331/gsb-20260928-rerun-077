@@ -239,7 +239,7 @@ func (lab *Lab) classifyLocked(manifest *raft.ForkManifest) *forkRecovery {
 	return recovery
 }
 
-// refreshPhaseLocked recomputes a non-canceled manifest's phase from the
+// refreshPhaseLocked recomputes a manifest's phase from the
 // records actually present, persisting the transition when it changes.
 func (lab *Lab) refreshPhaseLocked(manifest *raft.ForkManifest) {
 	if manifest.Phase == raft.ForkPhaseCanceled {
@@ -260,15 +260,15 @@ func (lab *Lab) refreshPhaseLocked(manifest *raft.ForkManifest) {
 	}
 }
 
-// activeManifestLocked returns the newest non-canceled manifest derived
-// from baseKey ("", baseKey, baseKey-r2, ...). Canceled manifests are
-// tombstones: a retried request after cancellation gets a fresh identity.
+// activeManifestLocked returns the manifest derived from baseKey. A
+// canceled recovery still owns this operation identity, so retrying the
+// fork cannot create a second valid pair for the same starting point.
 func (lab *Lab) activeManifestLocked(baseKey string) (string, *raft.ForkManifest) {
 	bestSuffix := -1
 	var best *raft.ForkManifest
 	for key, manifest := range lab.manifests {
 		suffix, ok := forkKeySuffix(baseKey, key)
-		if !ok || manifest.Phase == raft.ForkPhaseCanceled {
+		if !ok {
 			continue
 		}
 		if suffix > bestSuffix {
@@ -282,8 +282,8 @@ func (lab *Lab) activeManifestLocked(baseKey string) (string, *raft.ForkManifest
 	return best.ForkKey, best
 }
 
-// nextForkKeyLocked mints a fresh operation identity for baseKey when every
-// previous attempt was canceled.
+// nextForkKeyLocked allocates an identity for legacy retries that do not
+// already have a manifest for the frozen starting point.
 func (lab *Lab) nextForkKeyLocked(baseKey string) string {
 	maxSuffix := -1
 	for key := range lab.manifests {
@@ -679,9 +679,9 @@ func (lab *Lab) routes() *http.ServeMux {
 			}
 			// The operation exists but its pair is incomplete (damaged or
 			// missing side). Never mint look-alike branches: direct the
-			// user to the recovery preview instead.
+			// user to the existing recovery preview instead.
 			lab.mu.Unlock()
-			http.Error(w, "该暂停点的分叉记录不完整，请在“分叉恢复”区域预览并确认恢复，或取消后重新分叉", http.StatusConflict)
+			http.Error(w, "该暂停点的分叉记录不完整，请在“分叉恢复”区域预览并确认恢复", http.StatusConflict)
 			return
 		}
 		forkKey := lab.nextForkKeyLocked(baseKey)
@@ -779,7 +779,7 @@ func (lab *Lab) routes() *http.ServeMux {
 				CreatedAt:   manifest.CreatedAt,
 				UpdatedAt:   manifest.UpdatedAt,
 			}
-			if manifest.Phase == raft.ForkPhasePartial {
+			if manifest.Phase == raft.ForkPhasePartial || manifest.Phase == raft.ForkPhaseCanceled {
 				view.Recovery = lab.classifyLocked(manifest)
 			}
 			views = append(views, view)
@@ -803,18 +803,16 @@ func (lab *Lab) routes() *http.ServeMux {
 			return
 		}
 		if manifest.Phase == raft.ForkPhaseCanceled {
-			http.Error(w, "该分叉已取消，清单与损坏记录均保留为证据；如需继续请重新分叉", http.StatusConflict)
+			http.Error(w, "该恢复操作已取消，请重新发起恢复预览后再确认", http.StatusConflict)
 			return
 		}
-		lab.refreshPhaseLocked(manifest)
-		if manifest.Phase == raft.ForkPhaseComplete {
+		healthyA, _ := lab.sideHealthLocked(manifest, manifest.BranchAID)
+		healthyB, _ := lab.sideHealthLocked(manifest, manifest.BranchBID)
+		if healthyA != nil && healthyB != nil {
 			// Repeated confirm (double click, retry after restart): the pair
 			// is already intact, return it without rewriting anything.
-			expA, expB := lab.experiments[manifest.BranchAID], lab.experiments[manifest.BranchBID]
-			if expA != nil && expB != nil {
-				writeJSON(w, map[string]experimentView{"a": expA.view(), "b": expB.view()})
-				return
-			}
+			writeJSON(w, map[string]experimentView{"a": healthyA.view(), "b": healthyB.view()})
+			return
 		}
 		recovery := lab.classifyLocked(manifest)
 		if !recovery.Recoverable {
@@ -854,8 +852,45 @@ func (lab *Lab) routes() *http.ServeMux {
 		expA, expB := lab.experiments[manifest.BranchAID], lab.experiments[manifest.BranchBID]
 		writeJSON(w, map[string]experimentView{"a": expA.view(), "b": expB.view()})
 	}))
-	// Cancel keeps every piece of evidence (manifest tombstone, damaged
-	// record, healthy side) and only stops offering recovery.
+	// Preview after cancellation reopens the existing damaged pair without
+	// creating a new fork identity or changing either branch record.
+	mux.HandleFunc("POST /api/forks/{key}/preview", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		key := r.PathValue("key")
+		lab.mu.Lock()
+		defer lab.mu.Unlock()
+		lab.ensureManifestsLocked()
+		manifest, ok := lab.manifests[key]
+		if !ok {
+			http.Error(w, "fork manifest not found", http.StatusNotFound)
+			return
+		}
+		recovery := lab.classifyLocked(manifest)
+		if !recovery.Recoverable {
+			http.Error(w, recovery.Reason, http.StatusConflict)
+			return
+		}
+		if manifest.Phase != raft.ForkPhasePartial {
+			manifest.Phase = raft.ForkPhasePartial
+			manifest.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			if err := lab.saveManifestLocked(manifest); err != nil {
+				http.Error(w, "恢复预览状态保存失败："+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		writeJSON(w, forkView{
+			ForkKey:     manifest.ForkKey,
+			Phase:       manifest.Phase,
+			SourcePause: manifest.SourcePause,
+			SourceAt:    manifest.SourceAt,
+			BranchAID:   manifest.BranchAID,
+			BranchBID:   manifest.BranchBID,
+			CreatedAt:   manifest.CreatedAt,
+			UpdatedAt:   manifest.UpdatedAt,
+			Recovery:    recovery,
+		})
+	}))
+	// Cancel ends the current recovery interaction without changing any
+	// branch record. The same pair can be previewed and recovered again.
 	mux.HandleFunc("POST /api/forks/{key}/cancel", recoverMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		key := r.PathValue("key")
 		lab.mu.Lock()
